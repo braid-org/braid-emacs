@@ -150,17 +150,25 @@ socket that we write PUT request bytes onto directly."
    (braid-text-port bt)
    (braid-text-tls  bt)
    ;; Filter: count HTTP responses to decrement pending-puts.
+   ;; On non-2xx responses, reconnect to reload the server's true state.
    (lambda (_proc data)
      (let ((start 0)
-           (matched nil))
-       (while (string-match "HTTP/1\\.[01] " data start)
+           (matched nil)
+           (error-status nil))
+       (while (string-match "HTTP/1\\.[01] \\([0-9]+\\)" data start)
          (setq start (match-end 0))
          (setq matched t)
-         (cl-decf (braid-text-pending-puts bt)))
+         (let ((code (string-to-number (match-string 1 data))))
+           (cl-decf (braid-text-pending-puts bt))
+           (unless (and (>= code 200) (< code 300))
+             (setq error-status code))))
        (when matched
          (when (< (braid-text-pending-puts bt) 0)
            (setf (braid-text-pending-puts bt) 0))
-         (force-mode-line-update))))
+         (force-mode-line-update)
+         (when error-status
+           (message "Braid: PUT rejected (HTTP %d) — reconnecting" error-status)
+           (run-with-timer 0.1 nil #'braid-text--reconnect bt)))))
    ;; Sentinel: flush queued requests on open; reconnect on unexpected close.
    (lambda (proc event)
      (cond
