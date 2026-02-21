@@ -39,6 +39,7 @@
   (put-queue       "")     ; raw PUT request bytes queued while put-proc is connecting
   (pending-puts    0)      ; number of PUTs sent but not yet acked by server
   (put-ack-timer   nil)    ; one-shot timer: fires if PUTs go unacked too long
+  (saved-local-text nil)   ; buffer text saved before reconnect, flushed after snapshot
   (content-type    "text/plain") ; content-type from server, used in PUTs
   sub)                     ; braid-http-sub handle
 
@@ -87,8 +88,9 @@ Call this from `after-change-functions' whenever the buffer has been locally edi
 (defun braid-text--flush (bt)
   "Diff BT's buffer against its last-known state and PUT a patch if changed.
 The PUT is sent immediately on the persistent put-proc connection (pipelined)."
-  (let* ((new-state (braid-text--buffer-text bt))
-         (prev      (braid-text-prev-state bt)))
+  (unless (braid-text-saved-local-text bt)
+    (let* ((new-state (braid-text--buffer-text bt))
+           (prev      (braid-text-prev-state bt)))
     (unless (equal new-state prev)
       (let* ((diff          (braid-text--simple-diff prev new-state))
              (start         (plist-get diff :start))
@@ -125,7 +127,7 @@ The PUT is sent immediately on the persistent put-proc connection (pipelined)."
           (if (and proc (process-live-p proc))
               (process-send-string proc request)
             (setf (braid-text-put-queue bt)
-                  (concat (braid-text-put-queue bt) request))))))))
+                  (concat (braid-text-put-queue bt) request)))))))))
 
 (defun braid-text-close (bt)
   "Close BT's PUT connection and subscription, stopping all syncing."
@@ -139,11 +141,15 @@ The PUT is sent immediately on the persistent put-proc connection (pipelined)."
   (braid-http-unsubscribe (braid-text-sub bt)))
 
 (defun braid-text--reconnect (bt)
-  "Reconnect BT's subscription to recover from a digest mismatch.
-Closes the old subscription and opens a fresh one (no Parents header)
-so the server sends a full snapshot.  Resets version state so the
-snapshot is accepted."
-  (message "Braid: reconnecting to recover from digest mismatch")
+  "Reconnect BT's subscription to get a fresh snapshot from the server.
+Closes the old subscription and opens a fresh one (no Parents header).
+Saves the buffer's current text so it can be restored after the snapshot
+arrives — local edits are re-sent as a new PUT rather than being lost."
+  (message "Braid: reconnecting")
+  ;; Save local edits before reconnecting — they'll be re-sent after
+  ;; the server's snapshot arrives (see braid-text--on-message).
+  (when (buffer-live-p (braid-text-buffer bt))
+    (setf (braid-text-saved-local-text bt) (braid-text--buffer-text bt)))
   ;; Preserve callbacks and max-delay from the old subscription.
   (let* ((old-sub       (braid-text-sub bt))
          (on-connect    (braid-http-sub-on-connect old-sub))
@@ -152,9 +158,8 @@ snapshot is accepted."
          (hb-interval   (braid-http-sub-heartbeat-interval old-sub)))
     ;; Close the old subscription
     (braid-http-unsubscribe old-sub)
-    ;; Reset version state so the fresh snapshot is accepted
+    ;; Reset version so the fresh snapshot is accepted (parents=nil matches)
     (setf (braid-text-current-version bt) nil)
-    (setf (braid-text-prev-state bt) "")
     ;; Open a new subscription
     (let ((new-sub (braid-http-subscribe (braid-text-host bt)
                                     (braid-text-port bt)
@@ -283,13 +288,21 @@ current-version locally but never reached the server)."
                  (if body (format "%dchars" (length body)) "nil")))
       ;; Simpleton: only accept if parents == our current-version
       (when (equal parents (braid-text-current-version bt))
-        (let ((_before (when braid-text-debug (braid-text--buffer-text bt))))
+        (let ((_before (when braid-text-debug (braid-text--buffer-text bt)))
+              (saved   (braid-text-saved-local-text bt)))
           (condition-case err
               (progn
-                (if patches
-                    (braid-text--apply-patches bt patches)
-                  ;; Full body (initial snapshot or full replacement)
-                  (braid-text--set-buffer-text bt (or body "")))
+                (cond
+                 ;; Reconnecting with saved local edits — accept server metadata
+                 ;; but keep the buffer text so user's edits are preserved.
+                 (saved
+                  (setf (braid-text-saved-local-text bt) nil)
+                  (setf (braid-text-prev-state bt) (or body "")))
+                 ;; Normal: apply patches or snapshot to buffer
+                 (patches
+                  (braid-text--apply-patches bt patches))
+                 (t
+                  (braid-text--set-buffer-text bt (or body ""))))
                 ;; Advance version only after the apply succeeds, so a crash here
                 ;; does not silently advance the version and cause divergence.
                 (setf (braid-text-current-version bt)
@@ -298,14 +311,20 @@ current-version locally but never reached the server)."
                 (when-let ((ct (cdr (assoc "content-type" headers))))
                   (setf (braid-text-content-type bt) ct))
                 ;; Verify integrity if the server sent a repr-digest.
-                (when-let ((expected (cdr (assoc "repr-digest" headers))))
-                  (let ((actual (braid-text--repr-digest (braid-text--buffer-text bt))))
-                    (unless (equal actual expected)
-                      (message "Braid: DIGEST MISMATCH after version %s — reconnecting"
-                               version)
-                      ;; Schedule reconnect on next event loop iteration
-                      ;; (not inside the process filter).
-                      (run-with-timer 0.1 nil #'braid-text--reconnect bt)))))
+                ;; Skip when restoring saved local edits — buffer intentionally
+                ;; differs from the server's snapshot.
+                (unless saved
+                  (when-let ((expected (cdr (assoc "repr-digest" headers))))
+                    (let ((actual (braid-text--repr-digest (braid-text--buffer-text bt))))
+                      (unless (equal actual expected)
+                        (message "Braid: DIGEST MISMATCH after version %s — reconnecting"
+                                 version)
+                        ;; Schedule reconnect on next event loop iteration
+                        ;; (not inside the process filter).
+                        (run-with-timer 0.1 nil #'braid-text--reconnect bt)))))
+                ;; If we had saved local edits, flush to send them as a new PUT.
+                (when saved
+                  (braid-text--flush bt)))
             (error
              (message "Braid: failed to apply update (version %s): %S" version err))))))))
 

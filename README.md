@@ -19,11 +19,9 @@ Add to your Emacs init:
 (require 'braid-mode)
 ```
 
-### Live mode with braidfs
+### Live Editing
 
-The easiest way to use braid-emacs is with
-[braidfs](https://github.com/braid-org/braidfs), which mounts HTTP
-resources as files under `~/http/`.  When you open a file like:
+Now you can open files at web resources via your `~/http/` directory.  When you open a file like:
 
 ```
 ~/http/example.com/my-document
@@ -39,11 +37,14 @@ The path convention is:
 
 ```
 ~/http/<host>/<path>          → https://<host>/<path>
-~/http/<host>:<port>/<path>   → http://<host>:<port>/<path>
+~/http/<host>:<port>/<path>   → https://<host>:<port>/<path>
 ```
 
-This auto-connect behavior is controlled by `braid-mode-auto-live`
-(enabled by default).
+You can toggle `live` mode with `M-x braid-live`:
+1. **In live mode:** your file is always "saved" to the network.  Each keystroke live updates the web resource, and vice versa.  It never actually never saves to disk.  It syncs directly with the internet.
+2. **Otherwise:** your file is edited normally, like to disk.  If you have braidfs running, then it will use the `Save == Sync` semantics.
+
+Files opened within `~/http/*` will be `live` by default when opened. You can configure this with  `braid-mode-auto-live` (enabled by default).
 
 ### Manual connection
 
