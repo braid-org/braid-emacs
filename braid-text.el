@@ -194,41 +194,44 @@ advanced; stale requests with old parents would be rejected by the server."
 
 (defun braid-text--on-message (bt msg)
   "Handle an incoming subscription message for BT."
-  (let* ((version (plist-get msg :version))
-         (parents (sort (copy-sequence (plist-get msg :parents)) #'string<))
-         (patches (plist-get msg :patches))
-         (body    (plist-get msg :body))
-         (headers (plist-get msg :headers)))
-    (when braid-text-debug
-      (message "Braid: recv version=%s parents=%s cur=%s match=%s patches=%d body=%s"
-               version parents (braid-text-current-version bt)
-               (equal parents (braid-text-current-version bt))
-               (length (or patches '()))
-               (if body (format "%dchars" (length body)) "nil")))
-    ;; Simpleton: only accept if parents == our current-version
-    (when (equal parents (braid-text-current-version bt))
-      (let ((_before (when braid-text-debug (braid-text--buffer-text bt))))
-        (condition-case err
-            (progn
-              (if patches
-                  (braid-text--apply-patches bt patches)
-                ;; Full body (initial snapshot or full replacement)
-                (braid-text--set-buffer-text bt (or body "")))
-              ;; Advance version only after the apply succeeds, so a crash here
-              ;; does not silently advance the version and cause divergence.
-              (setf (braid-text-current-version bt)
-                    (sort (copy-sequence version) #'string<))
-              ;; Verify integrity if the server sent a repr-digest.
-              (when-let ((expected (cdr (assoc "repr-digest" headers))))
-                (let ((actual (braid-text--repr-digest (braid-text--buffer-text bt))))
-                  (unless (equal actual expected)
-                    (message "Braid: DIGEST MISMATCH after version %s — reconnecting"
-                             version)
-                    ;; Schedule reconnect on next event loop iteration
-                    ;; (not inside the process filter).
-                    (run-with-timer 0.1 nil #'braid-text--reconnect bt)))))
-          (error
-           (message "Braid: failed to apply update (version %s): %S" version err)))))))
+  (if (not (buffer-live-p (braid-text-buffer bt)))
+      ;; Buffer was killed — close the connection.
+      (braid-text-close bt)
+    (let* ((version (plist-get msg :version))
+           (parents (sort (copy-sequence (plist-get msg :parents)) #'string<))
+           (patches (plist-get msg :patches))
+           (body    (plist-get msg :body))
+           (headers (plist-get msg :headers)))
+      (when braid-text-debug
+        (message "Braid: recv version=%s parents=%s cur=%s match=%s patches=%d body=%s"
+                 version parents (braid-text-current-version bt)
+                 (equal parents (braid-text-current-version bt))
+                 (length (or patches '()))
+                 (if body (format "%dchars" (length body)) "nil")))
+      ;; Simpleton: only accept if parents == our current-version
+      (when (equal parents (braid-text-current-version bt))
+        (let ((_before (when braid-text-debug (braid-text--buffer-text bt))))
+          (condition-case err
+              (progn
+                (if patches
+                    (braid-text--apply-patches bt patches)
+                  ;; Full body (initial snapshot or full replacement)
+                  (braid-text--set-buffer-text bt (or body "")))
+                ;; Advance version only after the apply succeeds, so a crash here
+                ;; does not silently advance the version and cause divergence.
+                (setf (braid-text-current-version bt)
+                      (sort (copy-sequence version) #'string<))
+                ;; Verify integrity if the server sent a repr-digest.
+                (when-let ((expected (cdr (assoc "repr-digest" headers))))
+                  (let ((actual (braid-text--repr-digest (braid-text--buffer-text bt))))
+                    (unless (equal actual expected)
+                      (message "Braid: DIGEST MISMATCH after version %s — reconnecting"
+                               version)
+                      ;; Schedule reconnect on next event loop iteration
+                      ;; (not inside the process filter).
+                      (run-with-timer 0.1 nil #'braid-text--reconnect bt)))))
+            (error
+             (message "Braid: failed to apply update (version %s): %S" version err))))))))
 
 
 ;;;; ======================================================================

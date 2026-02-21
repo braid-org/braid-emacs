@@ -94,6 +94,12 @@ and ** when disconnected."
   ;; (e.g. when braidfs writes the synced content to the underlying file).
   (when buffer-file-name (set-visited-file-modtime)))
 
+(defun braid-mode--on-kill ()
+  "Clean up braid connection when the buffer is killed."
+  (when braid-mode--bt
+    (braid-text-close braid-mode--bt)
+    (setq braid-mode--bt nil)))
+
 ;;;###autoload
 (define-minor-mode braid-mode
   "Minor mode to sync the current buffer with a Braid-HTTP server.
@@ -103,6 +109,7 @@ Enable with `braid-connect'; disable to close the connection."
   (if braid-mode
       (progn
         (add-hook 'after-change-functions #'braid-mode--after-change nil t)
+        (add-hook 'kill-buffer-hook #'braid-mode--on-kill nil t)
         ;; Insert indicator near the left of the mode line, after mode-line-modified.
         (braid-mode--install-indicator)
         ;; Disable auto-save and backups for this buffer.
@@ -115,6 +122,7 @@ Enable with `braid-connect'; disable to close the connection."
         (setq braid-mode--saved-create-lockfiles create-lockfiles)
         (setq create-lockfiles nil))
     (remove-hook 'after-change-functions #'braid-mode--after-change t)
+    (remove-hook 'kill-buffer-hook #'braid-mode--on-kill t)
     ;; Remove indicator from mode line.
     (braid-mode--remove-indicator)
     ;; Restore auto-save, backup, and lock-file settings.
