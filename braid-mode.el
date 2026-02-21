@@ -151,20 +151,23 @@ where <first-component> may include a port, e.g. \"localhost:8888\"."
 
 (defun braid-live--parse-path (file)
   "Parse FILE (under `braid-http-dir') into (host port path).
-Returns nil if FILE is not under `braid-http-dir'."
+Returns nil if FILE is not under `braid-http-dir', or if the file
+is directly inside `braid-http-dir' (not in a subdirectory), or if
+the first path component is a dotfile (e.g. .braidfs)."
   (let ((root (file-name-as-directory (expand-file-name braid-http-dir))))
     (when (string-prefix-p root file)
       (let* ((rel        (substring file (length root)))
-             (slash      (string-match "/" rel))
-             (domain     (if slash (substring rel 0 slash) rel))
-             (path-rest  (if slash (substring rel slash) "/"))
-             (colon      (string-match ":" domain))
-             (host       (if colon (substring domain 0 colon) domain))
-             (tls        (not colon))
-             (port       (if colon
-                             (string-to-number (substring domain (1+ colon)))
-                           443)))
-        (list host port path-rest tls)))))
+             (slash      (string-match "/" rel)))
+        (when (and slash (> slash 0) (not (string-prefix-p "." rel)))
+          (let* ((domain     (substring rel 0 slash))
+                 (path-rest  (substring rel slash))
+                 (colon      (string-match ":" domain))
+                 (host       (if colon (substring domain 0 colon) domain))
+                 (tls        (not colon))
+                 (port       (if colon
+                                 (string-to-number (substring domain (1+ colon)))
+                               443)))
+            (list host port path-rest tls)))))))
 
 ;;;###autoload
 (defun braid-live ()
