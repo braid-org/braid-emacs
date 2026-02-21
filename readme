@@ -1,6 +1,0 @@
--*- mode: mikedown -*-
-
-## Javascript Coding Conventions
-
-Use snake_case, not camelCase.  Avoid all unnecessary punctuation, like semicolons, and curly braces, wherever you can.  We like python styles.  Prefer var over let or const.
-
