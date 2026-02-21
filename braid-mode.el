@@ -126,6 +126,11 @@ to the buffer.  This is expected and not a real conflict."
   (unless braid-mode
     (apply orig-fn args)))
 
+(defun braid-mode--save-noop ()
+  "No-op replacement for `save-buffer' in live braid-mode buffers."
+  (interactive)
+  (message "(Saved to network)"))
+
 (defun braid-mode--after-change (_beg _end _old-len)
   "Push local buffer edits to the server."
   (when braid-mode--bt
@@ -176,7 +181,7 @@ Enable with `braid-connect'; disable to close the connection."
               (and (bound-and-true-p auto-revert-mode) t))
         (when (bound-and-true-p auto-revert-mode)
           (auto-revert-mode -1))
-        ;; Disable auto-save and backups for this buffer.
+        ;; Disable auto-save, backups, and manual saves for this buffer.
         (setq braid-mode--saved-auto-save-name buffer-auto-save-file-name)
         (setq buffer-auto-save-file-name nil)
         (make-local-variable 'make-backup-files)
@@ -184,7 +189,9 @@ Enable with `braid-connect'; disable to close the connection."
         (setq make-backup-files nil)
         (make-local-variable 'create-lockfiles)
         (setq braid-mode--saved-create-lockfiles create-lockfiles)
-        (setq create-lockfiles nil))
+        (setq create-lockfiles nil)
+        ;; Make C-x C-s a no-op — edits are synced live, not saved to disk.
+        (local-set-key (kbd "C-x C-s") #'braid-mode--save-noop))
     (remove-hook 'after-change-functions #'braid-mode--after-change t)
     (remove-hook 'kill-buffer-hook #'braid-mode--on-kill t)
     ;; Remove indicator from mode line.
@@ -200,12 +207,13 @@ Enable with `braid-connect'; disable to close the connection."
     ;; Restore auto-revert if it was active before.
     (when braid-mode--saved-auto-revert
       (auto-revert-mode 1))
-    ;; Restore auto-save, backup, and lock-file settings.
+    ;; Restore auto-save, backup, lock-file, and save-buffer settings.
     (setq buffer-auto-save-file-name braid-mode--saved-auto-save-name)
     (setq make-backup-files braid-mode--saved-backup)
     (kill-local-variable 'make-backup-files)
     (setq create-lockfiles braid-mode--saved-create-lockfiles)
     (kill-local-variable 'create-lockfiles)
+    (local-unset-key (kbd "C-x C-s"))
     (when braid-mode--bt
       (braid-text-close braid-mode--bt)
       (setq braid-mode--bt nil)
