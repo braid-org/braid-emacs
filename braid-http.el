@@ -123,7 +123,7 @@ HEADERS is an alist of (name . value) pairs."
 (defun braid-http--format-put (host port path version parents body-headers body)
   "Format an HTTP PUT request string.
 VERSION and PARENTS are lists of version strings (Structured Headers format).
-BODY-HEADERS is an alist of additional headers (Content-Type, Content-Length, etc.).
+BODY-HEADERS is an alist of additional headers (Content-Type, etc.).
 BODY is a unibyte string of the request body."
   (let* ((version-headers
           (append `(("Host"    . ,(braid-http--format-host host port))
@@ -201,6 +201,10 @@ Returns (new-raw . new-body).  Partial chunks stay in new-raw."
   (reconnect-max-delay 30.0) ; upper bound for reconnect-delay
   (extra-headers    nil)   ; alist: extra GET headers (preserved across reconnects)
   (last-parents     nil)   ; list of strings: sent as Parents on reconnect
+  ;; Heartbeat-based dead-connection detection
+  (heartbeat-interval nil)   ; requested interval in seconds, or nil to disable
+  (heartbeat-timer    nil)   ; recurring check timer
+  (last-data-time     nil)   ; (float-time) of last data in filter
   ;; Callbacks
   on-message    ; (lambda (msg-plist))
   on-connect    ; (lambda ())
@@ -261,6 +265,20 @@ Returns nil if more data is needed."
               (setf (braid-http-sub-stage  sub) :sub-headers)
               (setf (braid-http-sub-status sub) :connected)
               (setf (braid-http-sub-reconnect-delay sub) 1.0) ; reset backoff
+              ;; Start heartbeat watchdog timer
+              (when-let ((hb (braid-http-sub-heartbeat-interval sub)))
+                (setf (braid-http-sub-last-data-time sub) (float-time))
+                (let ((timeout (+ (* 1.2 hb) 3)))
+                  (setf (braid-http-sub-heartbeat-timer sub)
+                        (run-with-timer
+                         15 15
+                         (lambda ()
+                           (when (and (eq (braid-http-sub-status sub) :connected)
+                                      (braid-http-sub-last-data-time sub)
+                                      (> (- (float-time) (braid-http-sub-last-data-time sub))
+                                         timeout))
+                             (message "Braid: heartbeat timeout (no data for %.0fs) — reconnecting" timeout)
+                             (delete-process (braid-http-sub-process sub))))))))
               (when (braid-http-sub-on-connect sub)
                 (funcall (braid-http-sub-on-connect sub))))
           ;; Non-209 (e.g. 200 snapshot): parse body via the existing :body stage
@@ -415,8 +433,15 @@ the SENTINEL will be called with an \"open\" event when ready."
 
 (defun braid-http--open (sub parents)
   "Open a fresh TCP/TLS connection for SUB, sending a GET with PARENTS."
-  (let* ((headers (append `(("Subscribe" . "true")
+  ;; Cancel any old heartbeat timer from a previous connection
+  (when (braid-http-sub-heartbeat-timer sub)
+    (cancel-timer (braid-http-sub-heartbeat-timer sub))
+    (setf (braid-http-sub-heartbeat-timer sub) nil))
+  (let* ((hb-interval (braid-http-sub-heartbeat-interval sub))
+         (headers (append `(("Subscribe" . "true")
                              ("Peer"      . ,(braid-http-sub-peer sub)))
+                           (when hb-interval
+                             `(("Heartbeats" . ,(format "%ds" hb-interval))))
                            (when parents
                              `(("Parents" . ,(braid-http--format-version parents))))
                            (braid-http-sub-extra-headers sub)))
@@ -446,6 +471,7 @@ the SENTINEL will be called with an \"open\" event when ready."
 
 (defun braid-http--filter (sub _proc data)
   "Process filter: accumulate DATA and pump the parser."
+  (setf (braid-http-sub-last-data-time sub) (float-time))
   (setf (braid-http-sub-raw-buf sub) (concat (braid-http-sub-raw-buf sub) data))
   (condition-case err
       (braid-http--pump sub)
@@ -495,7 +521,8 @@ Resets the backoff delay to 1.0.  No-op if SUB is not disconnected."
 ;;;; ======================================================================
 
 (cl-defun braid-http-subscribe (host port path on-message
-                          &key on-connect on-disconnect peer extra-headers tls)
+                          &key on-connect on-disconnect peer extra-headers tls
+                          heartbeat-interval)
   "Open a Braid-HTTP GET subscription to HOST:PORT/PATH.
 
 ON-MESSAGE is called for each sub-response in the 209 stream with a plist:
@@ -511,20 +538,24 @@ ON-DISCONNECT is called (no args) on any unexpected disconnect.
 
 PEER is a peer identifier string (random if omitted).
 EXTRA-HEADERS is an alist of additional GET headers sent on every connect.
+HEARTBEAT-INTERVAL, when non-nil, requests heartbeats from the server
+  every N seconds and kills the connection if no data arrives within
+  1.2*N+3 seconds.
 
 Returns a braid-http-sub struct.  Pass to braid-http-unsubscribe to close."
   (let ((sub (make-braid-http-sub
-              :host          host
-              :port          port
-              :path          path
-              :peer          (or peer (format "%04x%04x"
-                                              (random #xffff)
-                                              (random #xffff)))
-              :tls           tls
-              :on-message    on-message
-              :on-connect    on-connect
-              :on-disconnect on-disconnect
-              :extra-headers extra-headers)))
+              :host               host
+              :port               port
+              :path               path
+              :peer               (or peer (format "%04x%04x"
+                                                    (random #xffff)
+                                                    (random #xffff)))
+              :tls                tls
+              :on-message         on-message
+              :on-connect         on-connect
+              :on-disconnect      on-disconnect
+              :extra-headers      extra-headers
+              :heartbeat-interval heartbeat-interval)))
     (braid-http--open sub nil)
     sub))
 
@@ -534,6 +565,9 @@ Returns a braid-http-sub struct.  Pass to braid-http-unsubscribe to close."
   (when (braid-http-sub-reconnect-timer sub)
     (cancel-timer (braid-http-sub-reconnect-timer sub))
     (setf (braid-http-sub-reconnect-timer sub) nil))
+  (when (braid-http-sub-heartbeat-timer sub)
+    (cancel-timer (braid-http-sub-heartbeat-timer sub))
+    (setf (braid-http-sub-heartbeat-timer sub) nil))
   (when-let ((proc (braid-http-sub-process sub)))
     (when (process-live-p proc)
       (delete-process proc))))

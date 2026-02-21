@@ -1,7 +1,7 @@
 ;;; braid-http-tests.el --- ERT tests for braid-http.el -*- lexical-binding: t -*-
 ;;
 ;; Run unit tests:
-;;   emacs --batch -l braid-http.el -l braid-http-tests.el -f ert-run-tests-batch-and-exit
+;;   emacs --batch -L . -l braid-http-tests.el -f ert-run-tests-batch-and-exit
 ;;
 ;; Run integration tests (requires node server on 127.0.0.1:8888):
 ;;   emacs --batch -l braid-http.el -l braid-http-tests.el \
@@ -11,6 +11,7 @@
 
 (require 'ert)
 (require 'braid-http)
+(require 'braid-text)
 
 
 ;;;; ======================================================================
@@ -372,6 +373,196 @@ into the sub-headers parser, simulating what arrives after dechunking."
     (should (plist-get (nth 0 msgs) :patches))
     (should (null (plist-get (nth 1 msgs) :patches)))
     (should (equal (plist-get (nth 1 msgs) :body) "hello"))))
+
+
+;;;; ======================================================================
+;;;; Heartbeat dead-connection detection
+;;;; ======================================================================
+
+(ert-deftest braid-heartbeat/header-in-get ()
+  "Heartbeats header appears in GET request."
+  (let ((req (braid-http--format-get
+              "127.0.0.1" 8888 "/test"
+              '(("Subscribe" . "true")
+                ("Heartbeats" . "30s")))))
+    (should (string-match-p "Heartbeats: 30s\r\n" req))))
+
+(ert-deftest braid-heartbeat/filter-updates-last-data-time ()
+  "Process filter updates last-data-time on every data arrival."
+  (let ((sub (make-braid-http-sub
+              :host "127.0.0.1" :port 8888 :path "/test"
+              :peer "test"
+              :stage :sub-headers)))
+    (should (null (braid-http-sub-last-data-time sub)))
+    (braid-http--filter sub nil "some-data")
+    (should (braid-http-sub-last-data-time sub))
+    (should (< (- (float-time) (braid-http-sub-last-data-time sub)) 1.0))))
+
+(ert-deftest braid-heartbeat/timer-starts-on-209 ()
+  "Heartbeat timer starts when a 209 response is received."
+  (let ((sub (make-braid-http-sub
+              :host "127.0.0.1" :port 8888 :path "/test"
+              :peer "test"
+              :heartbeat-interval 30
+              :stage :outer-headers
+              :raw-buf "HTTP/1.1 209 \r\n\r\n"
+              :on-message (lambda (_)))))
+    (braid-http--pump sub)
+    (unwind-protect
+        (progn
+          (should (braid-http-sub-heartbeat-timer sub))
+          (should (braid-http-sub-last-data-time sub)))
+      (when (braid-http-sub-heartbeat-timer sub)
+        (cancel-timer (braid-http-sub-heartbeat-timer sub))))))
+
+(ert-deftest braid-heartbeat/no-timer-without-interval ()
+  "No heartbeat timer when heartbeat-interval is nil."
+  (let ((sub (make-braid-http-sub
+              :host "127.0.0.1" :port 8888 :path "/test"
+              :peer "test"
+              :heartbeat-interval nil
+              :stage :outer-headers
+              :raw-buf "HTTP/1.1 209 \r\n\r\n"
+              :on-message (lambda (_)))))
+    (braid-http--pump sub)
+    (should (null (braid-http-sub-heartbeat-timer sub)))))
+
+(ert-deftest braid-heartbeat/unsubscribe-cancels-timer ()
+  "Unsubscribing cancels the heartbeat timer."
+  (let ((sub (make-braid-http-sub
+              :host "127.0.0.1" :port 8888 :path "/test"
+              :peer "test"
+              :heartbeat-interval 30
+              :stage :outer-headers
+              :raw-buf "HTTP/1.1 209 \r\n\r\n"
+              :on-message (lambda (_)))))
+    (braid-http--pump sub)
+    (should (braid-http-sub-heartbeat-timer sub))
+    (braid-http-unsubscribe sub)
+    (should (null (braid-http-sub-heartbeat-timer sub)))))
+
+(ert-deftest braid-heartbeat/timeout-detected-when-stale ()
+  "Heartbeat timeout condition triggers when last-data-time is old enough."
+  (let* ((interval 30)
+         (timeout  (+ (* 1.2 interval) 3))  ; 39 seconds
+         (sub (make-braid-http-sub
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test"
+               :heartbeat-interval interval
+               :status :connected
+               :last-data-time (- (float-time) (+ timeout 1)))))
+    (should (> (- (float-time) (braid-http-sub-last-data-time sub))
+               timeout))))
+
+(ert-deftest braid-heartbeat/no-timeout-when-recent-data ()
+  "No timeout when data arrived recently."
+  (let* ((interval 30)
+         (timeout  (+ (* 1.2 interval) 3))
+         (sub (make-braid-http-sub
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test"
+               :heartbeat-interval interval
+               :status :connected
+               :last-data-time (float-time))))
+    (should-not (> (- (float-time) (braid-http-sub-last-data-time sub))
+                   timeout))))
+
+
+;;;; ======================================================================
+;;;; PUT ACK timeout
+;;;; ======================================================================
+
+(ert-deftest braid-put-ack/timer-starts-on-first-put ()
+  "PUT ACK timer starts when pending-puts transitions from 0 to >0."
+  (let* ((buf (generate-new-buffer " *braid-test*"))
+         (bt  (make-braid-text
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test" :buffer buf
+               :prev-state ""
+               :current-version '("v0"))))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (insert "hello"))
+          (should (null (braid-text-put-ack-timer bt)))
+          (braid-text--flush bt)
+          (should (braid-text-put-ack-timer bt))
+          (should (= (braid-text-pending-puts bt) 1)))
+      (when (braid-text-put-ack-timer bt)
+        (cancel-timer (braid-text-put-ack-timer bt)))
+      (kill-buffer buf))))
+
+(ert-deftest braid-put-ack/timer-not-restarted-on-subsequent-puts ()
+  "PUT ACK timer is not restarted when additional PUTs are sent."
+  (let* ((buf (generate-new-buffer " *braid-test*"))
+         (bt  (make-braid-text
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test" :buffer buf
+               :prev-state ""
+               :current-version '("v0"))))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (insert "hello"))
+          (braid-text--flush bt)
+          (let ((first-timer (braid-text-put-ack-timer bt)))
+            (should first-timer)
+            ;; Make another edit
+            (with-current-buffer buf
+              (goto-char (point-max))
+              (let ((inhibit-modification-hooks t))
+                (insert "!")))
+            (braid-text--flush bt)
+            ;; Same timer, not a new one
+            (should (eq (braid-text-put-ack-timer bt) first-timer))
+            (should (= (braid-text-pending-puts bt) 2))))
+      (when (braid-text-put-ack-timer bt)
+        (cancel-timer (braid-text-put-ack-timer bt)))
+      (kill-buffer buf))))
+
+(ert-deftest braid-put-ack/connection-dead-resets-state ()
+  "braid-text--connection-dead resets pending-puts and triggers reconnect."
+  (let* ((buf (generate-new-buffer " *braid-test*"))
+         (sub (make-braid-http-sub
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test"))
+         (bt  (make-braid-text
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test" :buffer buf
+               :pending-puts 3
+               :put-ack-timer (run-with-timer 999 nil #'ignore)
+               :sub sub))
+         (reconnect-called nil))
+    (unwind-protect
+        (cl-letf (((symbol-function 'braid-text--put-proc-reconnect)
+                   (lambda (_bt) nil))
+                  ((symbol-function 'braid-text--reconnect)
+                   (lambda (_bt) (setq reconnect-called t))))
+          (braid-text--connection-dead bt)
+          (should (= (braid-text-pending-puts bt) 0))
+          (should (null (braid-text-put-ack-timer bt)))
+          (should reconnect-called))
+      (when (braid-text-put-ack-timer bt)
+        (cancel-timer (braid-text-put-ack-timer bt)))
+      (kill-buffer buf))))
+
+(ert-deftest braid-put-ack/close-cancels-timer ()
+  "braid-text-close cancels the PUT ACK timer."
+  (let* ((buf (generate-new-buffer " *braid-test*"))
+         (sub (make-braid-http-sub
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test"))
+         (bt  (make-braid-text
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test" :buffer buf
+               :put-ack-timer (run-with-timer 999 nil #'ignore)
+               :sub sub)))
+    (unwind-protect
+        (progn
+          (should (braid-text-put-ack-timer bt))
+          (braid-text-close bt)
+          (should (null (braid-text-put-ack-timer bt))))
+      (when (braid-text-put-ack-timer bt)
+        (cancel-timer (braid-text-put-ack-timer bt)))
+      (when (buffer-live-p buf) (kill-buffer buf)))))
 
 
 ;;;; ======================================================================

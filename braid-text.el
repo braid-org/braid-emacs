@@ -20,6 +20,9 @@
 (defvar braid-text-debug nil
   "When non-nil, log buffer state before/after each applied update.")
 
+(defvar braid-text-put-ack-timeout 20.0
+  "Seconds to wait for a PUT ACK before declaring the connection dead.")
+
 
 ;;;; ======================================================================
 ;;;; Struct
@@ -35,6 +38,7 @@
   (put-proc        nil)    ; persistent network process for pipelining PUTs
   (put-queue       "")     ; raw PUT request bytes queued while put-proc is connecting
   (pending-puts    0)      ; number of PUTs sent but not yet acked by server
+  (put-ack-timer   nil)    ; one-shot timer: fires if PUTs go unacked too long
   (content-type    "text/plain") ; content-type from server, used in PUTs
   sub)                     ; braid-http-sub handle
 
@@ -43,14 +47,18 @@
 ;;;; Public API
 ;;;; ======================================================================
 
-(cl-defun braid-text-open (host port path buffer &key tls on-connect on-disconnect)
+(cl-defun braid-text-open (host port path buffer
+                          &key tls on-connect on-disconnect
+                          (heartbeat-interval 30))
   "Subscribe BUFFER to the braid-text resource at HOST:PORT/PATH.
 Uses the simpleton merge type.  Returns a braid-text struct.
 Pass the struct to `braid-text-buffer-changed' whenever the buffer
 is locally edited, and to `braid-text-close' to disconnect.
 
 ON-CONNECT and ON-DISCONNECT are optional callbacks forwarded to
-`braid-http-subscribe'."
+`braid-http-subscribe'.
+HEARTBEAT-INTERVAL (default 30) requests server heartbeats every N seconds.
+Set to nil to disable heartbeat-based dead connection detection."
   (let* ((peer (format "%04x%04x" (random #xffff) (random #xffff)))
          (bt   (make-braid-text :host   host
                                 :port   port
@@ -65,6 +73,7 @@ ON-CONNECT and ON-DISCONNECT are optional callbacks forwarded to
                            :tls           tls
                            :on-connect    on-connect
                            :on-disconnect on-disconnect
+                           :heartbeat-interval heartbeat-interval
                            :extra-headers '(("Merge-Type" . "simpleton")
                                              ("Accept"     . "text/plain, text/markdown, text/html, application/json"))))
     (setf (braid-text-put-proc bt) (braid-text--put-proc-open bt))
@@ -103,6 +112,15 @@ The PUT is sent immediately on the persistent put-proc connection (pipelined)."
                (proc          (braid-text-put-proc bt)))
           (setf (braid-text-current-version bt) version)
           (setf (braid-text-prev-state bt) new-state)
+          ;; Start PUT ACK timer when transitioning 0 → >0
+          (when (and (= (braid-text-pending-puts bt) 0)
+                     (not (braid-text-put-ack-timer bt)))
+            (setf (braid-text-put-ack-timer bt)
+                  (run-with-timer
+                   braid-text-put-ack-timeout nil
+                   (lambda ()
+                     (when (> (braid-text-pending-puts bt) 0)
+                       (braid-text--connection-dead bt))))))
           (cl-incf (braid-text-pending-puts bt))
           (if (and proc (process-live-p proc))
               (process-send-string proc request)
@@ -111,6 +129,9 @@ The PUT is sent immediately on the persistent put-proc connection (pipelined)."
 
 (defun braid-text-close (bt)
   "Close BT's PUT connection and subscription, stopping all syncing."
+  (when (braid-text-put-ack-timer bt)
+    (cancel-timer (braid-text-put-ack-timer bt))
+    (setf (braid-text-put-ack-timer bt) nil))
   (when-let ((p (braid-text-put-proc bt)))
     (when (process-live-p p) (delete-process p)))
   (setf (braid-text-put-proc  bt) nil)
@@ -127,7 +148,8 @@ snapshot is accepted."
   (let* ((old-sub       (braid-text-sub bt))
          (on-connect    (braid-http-sub-on-connect old-sub))
          (on-disconnect (braid-http-sub-on-disconnect old-sub))
-         (max-delay     (braid-http-sub-reconnect-max-delay old-sub)))
+         (max-delay     (braid-http-sub-reconnect-max-delay old-sub))
+         (hb-interval   (braid-http-sub-heartbeat-interval old-sub)))
     ;; Close the old subscription
     (braid-http-unsubscribe old-sub)
     ;; Reset version state so the fresh snapshot is accepted
@@ -142,6 +164,7 @@ snapshot is accepted."
                                     :tls           (braid-text-tls bt)
                                     :on-connect    on-connect
                                     :on-disconnect on-disconnect
+                                    :heartbeat-interval hb-interval
                                     :extra-headers '(("Merge-Type" . "simpleton")
                                                       ("Accept"     . "text/plain, text/markdown, text/html, application/json")))))
       (setf (braid-http-sub-reconnect-max-delay new-sub) max-delay)
@@ -178,6 +201,11 @@ socket that we write PUT request bytes onto directly."
        (when matched
          (when (< (braid-text-pending-puts bt) 0)
            (setf (braid-text-pending-puts bt) 0))
+         ;; Cancel PUT ACK timer when all PUTs are acked
+         (when (and (<= (braid-text-pending-puts bt) 0)
+                    (braid-text-put-ack-timer bt))
+           (cancel-timer (braid-text-put-ack-timer bt))
+           (setf (braid-text-put-ack-timer bt) nil))
          (force-mode-line-update)
          (when error-status
            (message "Braid: PUT rejected (HTTP %d) — reconnecting" error-status)
@@ -204,6 +232,27 @@ Clears the put-queue because queued requests had their versions optimistically
 advanced; stale requests with old parents would be rejected by the server."
   (setf (braid-text-put-queue bt) "")
   (setf (braid-text-put-proc  bt) (braid-text--put-proc-open bt)))
+
+(defun braid-text--connection-dead (bt)
+  "Handle a detected dead connection for BT.
+Cancels the PUT ACK timer, resets pending-puts, reconnects the put-proc,
+and reopens the subscription with a version reset (since lost PUTs advanced
+current-version locally but never reached the server)."
+  (message "Braid: connection dead (PUT ACK timeout) — reconnecting")
+  ;; Cancel the timer
+  (when (braid-text-put-ack-timer bt)
+    (cancel-timer (braid-text-put-ack-timer bt))
+    (setf (braid-text-put-ack-timer bt) nil))
+  ;; Reset pending-puts — the lost PUTs will never be acked
+  (setf (braid-text-pending-puts bt) 0)
+  (force-mode-line-update)
+  ;; Kill and reopen the put-proc
+  (when-let ((p (braid-text-put-proc bt)))
+    (when (process-live-p p) (delete-process p)))
+  (braid-text--put-proc-reconnect bt)
+  ;; Reconnect the subscription with a version reset, since lost PUTs
+  ;; advanced current-version locally but never reached the server
+  (braid-text--reconnect bt))
 
 
 ;;;; ======================================================================
