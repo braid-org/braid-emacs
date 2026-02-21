@@ -45,6 +45,7 @@
   (char-counter    -1)     ; cumulative char-delta; used to form version IDs
   (put-proc        nil)    ; persistent network process for pipelining PUTs
   (put-queue       "")     ; raw PUT request bytes queued while put-proc is connecting
+  (pending-puts    0)      ; number of PUTs sent but not yet acked by server
   sub)                     ; braid-sub handle
 
 
@@ -106,6 +107,7 @@ The PUT is sent immediately on the persistent put-proc connection (pipelined)."
                (proc          (braid-text-put-proc bt)))
           (setf (braid-text-current-version bt) version)
           (setf (braid-text-prev-state bt) new-state)
+          (cl-incf (braid-text-pending-puts bt))
           (if (and proc (process-live-p proc))
               (process-send-string proc request)
             (setf (braid-text-put-queue bt)
@@ -155,8 +157,18 @@ socket that we write PUT request bytes onto directly."
    (braid-text-host bt)
    (braid-text-port bt)
    (braid-text-tls  bt)
-   ;; Filter: consume and discard 200 OK responses so the socket stays healthy.
-   (lambda (_proc _data) nil)
+   ;; Filter: count HTTP responses to decrement pending-puts.
+   (lambda (_proc data)
+     (let ((start 0)
+           (matched nil))
+       (while (string-match "HTTP/1\\.[01] " data start)
+         (setq start (match-end 0))
+         (setq matched t)
+         (cl-decf (braid-text-pending-puts bt)))
+       (when matched
+         (when (< (braid-text-pending-puts bt) 0)
+           (setf (braid-text-pending-puts bt) 0))
+         (force-mode-line-update))))
    ;; Sentinel: flush queued requests on open; reconnect on unexpected close.
    (lambda (proc event)
      (cond

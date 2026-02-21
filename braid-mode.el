@@ -64,13 +64,29 @@
 ;;;; Minor mode
 ;;;; ======================================================================
 
-(defun braid-mode--lighter ()
-  "Return the mode-line string for `braid-mode'."
-  (if (null braid-mode--bt)
-      " ○"
-    (pcase (braid-sub-status (braid-text-sub braid-mode--bt))
-      (:connected "●")
-      (_          "○"))))
+(defvar-local braid-mode--saved-mode-line-modified nil
+  "Saved `mode-line-modified' value restored when `braid-mode' is disabled.")
+
+(defun braid-mode--install-indicator ()
+  "Replace `mode-line-modified' with the braid status indicator.
+Shows ●● when connected and synced, ○○ when edits are pending ack,
+and ** when disconnected."
+  (setq braid-mode--saved-mode-line-modified mode-line-modified)
+  (setq-local mode-line-modified
+              '(:eval (cond
+                       ((null braid-mode--bt) "○○")
+                       ((not (eq (braid-sub-status (braid-text-sub braid-mode--bt))
+                                 :connected))
+                        "**")
+                       ((> (braid-text-pending-puts braid-mode--bt) 0)
+                        "○○")
+                       (t "●●")))))
+
+(defun braid-mode--remove-indicator ()
+  "Restore the original `mode-line-modified'."
+  (if braid-mode--saved-mode-line-modified
+      (setq-local mode-line-modified braid-mode--saved-mode-line-modified)
+    (kill-local-variable 'mode-line-modified)))
 
 (defun braid-mode--after-change (_beg _end _old-len)
   "Push local buffer edits to the server."
@@ -87,11 +103,13 @@
 (define-minor-mode braid-mode
   "Minor mode to sync the current buffer with a Braid-HTTP server.
 Enable with `braid-connect'; disable to close the connection."
-  :lighter (:eval (braid-mode--lighter))
+  :lighter nil
   :group 'braid
   (if braid-mode
       (progn
         (add-hook 'after-change-functions #'braid-mode--after-change nil t)
+        ;; Insert indicator near the left of the mode line, after mode-line-modified.
+        (braid-mode--install-indicator)
         ;; Disable auto-save and backups for this buffer.
         (setq braid-mode--saved-auto-save-name buffer-auto-save-file-name)
         (setq buffer-auto-save-file-name nil)
@@ -102,6 +120,8 @@ Enable with `braid-connect'; disable to close the connection."
         (setq braid-mode--saved-create-lockfiles create-lockfiles)
         (setq create-lockfiles nil))
     (remove-hook 'after-change-functions #'braid-mode--after-change t)
+    ;; Remove indicator from mode line.
+    (braid-mode--remove-indicator)
     ;; Restore auto-save, backup, and lock-file settings.
     (setq buffer-auto-save-file-name braid-mode--saved-auto-save-name)
     (setq make-backup-files braid-mode--saved-backup)
