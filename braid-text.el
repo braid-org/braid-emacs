@@ -35,6 +35,7 @@
   (put-proc        nil)    ; persistent network process for pipelining PUTs
   (put-queue       "")     ; raw PUT request bytes queued while put-proc is connecting
   (pending-puts    0)      ; number of PUTs sent but not yet acked by server
+  (content-type    "text/plain") ; content-type from server, used in PUTs
   sub)                     ; braid-http-sub handle
 
 
@@ -59,7 +60,8 @@ is locally edited, and to `braid-text-close' to disconnect."
                            (lambda (msg) (braid-text--on-message bt msg))
                            :peer          peer
                            :tls           tls
-                           :extra-headers '(("Merge-Type" . "simpleton"))))
+                           :extra-headers '(("Merge-Type" . "simpleton")
+                                             ("Accept"     . "text/plain, text/markdown, text/html, application/json"))))
     (setf (braid-text-put-proc bt) (braid-text--put-proc-open bt))
     bt))
 
@@ -85,7 +87,7 @@ The PUT is sent immediately on the persistent put-proc connection (pipelined)."
                                             (braid-text-peer bt)
                                             (braid-text-char-counter bt))))
                (content-bytes (encode-coding-string content 'utf-8))
-               (body-headers  `(("Content-Type"   . "text/plain")
+               (body-headers  `(("Content-Type"   . ,(braid-text-content-type bt))
                                  ("Merge-Type"     . "simpleton")
                                  ("Content-Length" . ,(number-to-string (length content-bytes)))
                                  ("Content-Range"  . ,(format "text [%d:%d]" start end))
@@ -129,7 +131,8 @@ snapshot is accepted."
                          (lambda (msg) (braid-text--on-message bt msg))
                          :peer          (braid-text-peer bt)
                          :tls           (braid-text-tls bt)
-                         :extra-headers '(("Merge-Type" . "simpleton")))))
+                         :extra-headers '(("Merge-Type" . "simpleton")
+                                           ("Accept"     . "text/plain, text/markdown, text/html, application/json")))))
 
 
 ;;;; ======================================================================
@@ -221,6 +224,9 @@ advanced; stale requests with old parents would be rejected by the server."
                 ;; does not silently advance the version and cause divergence.
                 (setf (braid-text-current-version bt)
                       (sort (copy-sequence version) #'string<))
+                ;; Capture content-type from server for use in PUTs.
+                (when-let ((ct (cdr (assoc "content-type" headers))))
+                  (setf (braid-text-content-type bt) ct))
                 ;; Verify integrity if the server sent a repr-digest.
                 (when-let ((expected (cdr (assoc "repr-digest" headers))))
                   (let ((actual (braid-text--repr-digest (braid-text--buffer-text bt))))
