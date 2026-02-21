@@ -54,6 +54,9 @@
 (defvar-local braid-mode--saved-create-lockfiles nil
   "Saved `create-lockfiles' value restored when `braid-mode' is disabled.")
 
+(defvar-local braid-mode--saved-auto-revert nil
+  "Non-nil if `auto-revert-mode' was active before `braid-mode' was enabled.")
+
 
 ;;;; ======================================================================
 ;;;; Minor mode
@@ -83,6 +86,14 @@ and ** when disconnected."
       (setq-local mode-line-modified braid-mode--saved-mode-line-modified)
     (kill-local-variable 'mode-line-modified)))
 
+(defun braid-mode--suppress-supersession (orig-fn &rest args)
+  "Suppress the supersession warning for braid-mode buffers.
+braidfs writes synced content to disk asynchronously, so the file's
+modtime may advance after braid-text has already applied the update
+to the buffer.  This is expected and not a real conflict."
+  (unless braid-mode
+    (apply orig-fn args)))
+
 (defun braid-mode--after-change (_beg _end _old-len)
   "Push local buffer edits to the server."
   (when braid-mode--bt
@@ -98,7 +109,13 @@ and ** when disconnected."
   "Clean up braid connection when the buffer is killed."
   (when braid-mode--bt
     (braid-text-close braid-mode--bt)
-    (setq braid-mode--bt nil)))
+    (setq braid-mode--bt nil))
+  ;; Remove supersession advice if no other braid-mode buffers remain.
+  (unless (cl-some (lambda (b) (and (not (eq b (current-buffer)))
+                                    (buffer-local-value 'braid-mode b)))
+                   (buffer-list))
+    (advice-remove 'ask-user-about-supersession-threat
+                   #'braid-mode--suppress-supersession)))
 
 ;;;###autoload
 (define-minor-mode braid-mode
@@ -112,6 +129,16 @@ Enable with `braid-connect'; disable to close the connection."
         (add-hook 'kill-buffer-hook #'braid-mode--on-kill nil t)
         ;; Insert indicator near the left of the mode line, after mode-line-modified.
         (braid-mode--install-indicator)
+        ;; Suppress "file changed on disk" warnings — braidfs updates the
+        ;; underlying file asynchronously, which is expected, not a conflict.
+        (advice-add 'ask-user-about-supersession-threat
+                    :around #'braid-mode--suppress-supersession)
+        ;; Disable auto-revert — braidfs file writes would cause it to
+        ;; revert the buffer, fighting with braid-text's live sync.
+        (setq braid-mode--saved-auto-revert
+              (and (bound-and-true-p auto-revert-mode) t))
+        (when (bound-and-true-p auto-revert-mode)
+          (auto-revert-mode -1))
         ;; Disable auto-save and backups for this buffer.
         (setq braid-mode--saved-auto-save-name buffer-auto-save-file-name)
         (setq buffer-auto-save-file-name nil)
@@ -125,6 +152,15 @@ Enable with `braid-connect'; disable to close the connection."
     (remove-hook 'kill-buffer-hook #'braid-mode--on-kill t)
     ;; Remove indicator from mode line.
     (braid-mode--remove-indicator)
+    ;; Remove supersession advice if no other braid-mode buffers need it.
+    (unless (cl-some (lambda (b) (and (not (eq b (current-buffer)))
+                                      (buffer-local-value 'braid-mode b)))
+                     (buffer-list))
+      (advice-remove 'ask-user-about-supersession-threat
+                     #'braid-mode--suppress-supersession))
+    ;; Restore auto-revert if it was active before.
+    (when braid-mode--saved-auto-revert
+      (auto-revert-mode 1))
     ;; Restore auto-save, backup, and lock-file settings.
     (setq buffer-auto-save-file-name braid-mode--saved-auto-save-name)
     (setq make-backup-files braid-mode--saved-backup)
