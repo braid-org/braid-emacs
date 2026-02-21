@@ -23,6 +23,27 @@
 
 
 ;;;; ======================================================================
+;;;; Configuration
+;;;; ======================================================================
+
+(defcustom braid-http-cookies nil
+  "Alist mapping hostnames to cookie strings.
+Each entry is (HOST . COOKIE-STRING) where HOST is matched against
+the request's Host header value (e.g. \"example.com\" or \"localhost:8888\").
+COOKIE-STRING is sent as the Cookie header value."
+  :type '(alist :key-type string :value-type string)
+  :group 'braid)
+
+(defun braid-http--cookie-header (host port)
+  "Return a Cookie header alist entry for HOST:PORT, or nil.
+Looks up the formatted host (via `braid-http--format-host') in
+`braid-http-cookies'."
+  (when-let ((cookie (cdr (assoc (braid-http--format-host host port)
+                                 braid-http-cookies))))
+    `(("Cookie" . ,cookie))))
+
+
+;;;; ======================================================================
 ;;;; Structured Headers: Version / Parents
 ;;;; ======================================================================
 ;; Format per draft-toomim-httpbis-versions:
@@ -92,11 +113,12 @@ Returns an alist of (lowercase-name . value) pairs."
 (defun braid-http--format-get (host port path headers)
   "Format an HTTP GET request string.
 HEADERS is an alist of (name . value) pairs."
-  (concat (format "GET %s HTTP/1.1\r\n" path)
-          (format "Host: %s\r\n" (braid-http--format-host host port))
-          (mapconcat (lambda (h) (format "%s: %s\r\n" (car h) (cdr h)))
-                     headers "")
-          "\r\n"))
+  (let ((all-headers (append headers (braid-http--cookie-header host port))))
+    (concat (format "GET %s HTTP/1.1\r\n" path)
+            (format "Host: %s\r\n" (braid-http--format-host host port))
+            (mapconcat (lambda (h) (format "%s: %s\r\n" (car h) (cdr h)))
+                       all-headers "")
+            "\r\n")))
 
 (defun braid-http--format-put (host port path version parents body-headers body)
   "Format an HTTP PUT request string.
@@ -107,7 +129,8 @@ BODY is a unibyte string of the request body."
           (append `(("Host"    . ,(braid-http--format-host host port))
                     ("Version" . ,(braid-http--format-version version))
                     ("Parents" . ,(braid-http--format-version parents)))
-                  body-headers)))
+                  body-headers
+                  (braid-http--cookie-header host port))))
     (concat (format "PUT %s HTTP/1.1\r\n" path)
             (mapconcat (lambda (h) (format "%s: %s\r\n" (car h) (cdr h)))
                        version-headers "")
