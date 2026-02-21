@@ -3,11 +3,7 @@
 Collaborative editing from Emacs to anything and everything using the
 [Braid-HTTP](https://braid.org) protocol.
 
-## How it works
-
-Braid-Emacs syncs Emacs with HTTP resources.  Uses the [simpleton](https://braid.org/simpleton) merge algorithm.  Implements HTTP with a raw TLS over TCP connection and reads/writes Braid-HTTP in Emacs Lisp.
-
-## Setup
+## Installation
 
 Add to your Emacs init:
 
@@ -15,6 +11,12 @@ Add to your Emacs init:
 (add-to-list 'load-path "~/path/to/braid-emacs")
 (require 'braid-mode)
 ```
+
+## How it works
+
+Syncs Emacs with HTTP resources.  
+Uses the [simpleton](https://braid.org/simpleton) merge algorithm.  
+Implements HTTP with a raw TLS over TCP connection and reads/writes Braid-HTTP in Emacs Lisp.
 
 ### Live Editing
 
