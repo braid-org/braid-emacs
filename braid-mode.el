@@ -129,7 +129,7 @@ to the buffer.  This is expected and not a real conflict."
 (defun braid-mode--save-noop ()
   "No-op replacement for `save-buffer' in live braid-mode buffers."
   (interactive)
-  (message "(Saved to network)"))
+  (message "(No no; already saved to network!)"))
 
 (defun braid-mode--after-change (_beg _end _old-len)
   "Push local buffer edits to the server."

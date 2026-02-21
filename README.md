@@ -5,7 +5,7 @@ Collaborative editing from Emacs to anything and everything using the
 
 ## How it works
 
-Braid-Emacs syncs Emacs buffers with HTTP resources.  Uses the [simpleton](https://braid.org/simpleton) merge algorithm.  Implements HTTP with a raw TCP / TLS connection and reads/writes Braid-HTTP via Emacs Lisp.
+Braid-Emacs syncs Emacs with HTTP resources.  Uses the [simpleton](https://braid.org/simpleton) merge algorithm.  Implements HTTP with a raw TLS over TCP connection and reads/writes Braid-HTTP in Emacs Lisp.
 
 ## Setup
 
