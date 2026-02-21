@@ -1,4 +1,4 @@
-# braid-emacs
+# Braid-Emacs
 
 **Work in progress.** Collaborative editing for Emacs using the
 [Braid-HTTP](https://braid.org) protocol.
