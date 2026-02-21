@@ -1,0 +1,387 @@
+;;; braid-text.el --- Braid-HTTP simpleton client (buffer-based) -*- lexical-binding: t -*-
+
+;; Author: Michael Toomim <toomim@gmail.com>
+;; Version: 0.1.0
+;; Package-Requires: ((emacs "27.1"))
+;; URL: https://github.com/braid-org/braid-emacs
+;; Keywords: comm, tools
+
+;;
+;; Implements the simpleton sync algorithm on top of braid-http.el.
+;; Connects an Emacs buffer to a braid-text server resource.
+;;
+;; Public API:
+;;   (braid-text-open HOST PORT PATH BUFFER)  → braid-text struct
+;;   (braid-text-buffer-changed BT)           ; call from after-change-functions
+;;   (braid-text-close BT)
+;;
+;; Usage sketch (see braid-mode.el for the full Emacs integration):
+;;
+;;   (setq bt (braid-text-open "127.0.0.1" 8888 "/text/doc" (current-buffer)))
+;;   ;; ... make some edits, then:
+;;   (braid-text-buffer-changed bt)
+;;   ;; ... later:
+;;   (braid-text-close bt)
+
+;;; Code:
+
+(require 'cl-lib)
+(require 'braid-http)
+
+(defvar braid-text-debug nil
+  "When non-nil, log buffer state before/after each applied update.")
+
+
+;;;; ======================================================================
+;;;; Struct
+;;;; ======================================================================
+
+(cl-defstruct braid-text
+  "State for one simpleton-synced buffer."
+  host port path peer buffer
+  (tls             nil)    ; t to use TLS
+  (current-version nil)    ; sorted list of version strings (what we last saw/sent)
+  (prev-state      "")     ; buffer text as of current-version
+  (char-counter    -1)     ; cumulative char-delta; used to form version IDs
+  (put-proc        nil)    ; persistent network process for pipelining PUTs
+  (put-queue       "")     ; raw PUT request bytes queued while put-proc is connecting
+  sub)                     ; braid-sub handle
+
+
+;;;; ======================================================================
+;;;; Public API
+;;;; ======================================================================
+
+(cl-defun braid-text-open (host port path buffer &key tls)
+  "Subscribe BUFFER to the braid-text resource at HOST:PORT/PATH.
+Uses the simpleton merge type.  Returns a braid-text struct.
+Pass the struct to `braid-text-buffer-changed' whenever the buffer
+is locally edited, and to `braid-text-close' to disconnect."
+  (let* ((peer (format "%04x%04x" (random #xffff) (random #xffff)))
+         (bt   (make-braid-text :host   host
+                                :port   port
+                                :path   path
+                                :peer   peer
+                                :buffer buffer
+                                :tls    tls)))
+    (setf (braid-text-sub bt)
+          (braid-subscribe host port path
+                           (lambda (msg) (braid-text--on-message bt msg))
+                           :peer          peer
+                           :tls           tls
+                           :extra-headers '(("Merge-Type" . "simpleton"))))
+    (setf (braid-text-put-proc bt) (braid-text--put-proc-open bt))
+    bt))
+
+(defun braid-text-buffer-changed (bt)
+  "Diff BT's buffer against its last-known state and PUT a patch if changed.
+Call this from `after-change-functions' whenever the buffer has been locally edited."
+  (braid-text--flush bt))
+
+(defun braid-text--flush (bt)
+  "Diff BT's buffer against its last-known state and PUT a patch if changed.
+The PUT is sent immediately on the persistent put-proc connection (pipelined)."
+  (let* ((new-state (braid-text--buffer-text bt))
+         (prev      (braid-text-prev-state bt)))
+    (unless (equal new-state prev)
+      (let* ((diff          (braid-text--simple-diff prev new-state))
+             (start         (plist-get diff :start))
+             (end           (plist-get diff :end))
+             (content       (plist-get diff :content))
+             (delta         (+ (- end start) (length content)))
+             (parents       (braid-text-current-version bt)))
+        (cl-incf (braid-text-char-counter bt) delta)
+        (let* ((version       (list (format "%s-%d"
+                                            (braid-text-peer bt)
+                                            (braid-text-char-counter bt))))
+               (content-bytes (encode-coding-string content 'utf-8))
+               (body-headers  `(("Content-Type"   . "text/plain")
+                                 ("Merge-Type"     . "simpleton")
+                                 ("Content-Length" . ,(number-to-string (length content-bytes)))
+                                 ("Content-Range"  . ,(format "text [%d:%d]" start end))
+                                 ("Peer"           . ,(braid-text-peer bt))))
+               (request       (braid-http--format-put
+                                (braid-text-host bt) (braid-text-port bt) (braid-text-path bt)
+                                version parents body-headers content-bytes))
+               (proc          (braid-text-put-proc bt)))
+          (setf (braid-text-current-version bt) version)
+          (setf (braid-text-prev-state bt) new-state)
+          (if (and proc (process-live-p proc))
+              (process-send-string proc request)
+            (setf (braid-text-put-queue bt)
+                  (concat (braid-text-put-queue bt) request))))))))
+
+(defun braid-text-close (bt)
+  "Close BT's PUT connection and subscription, stopping all syncing."
+  (when-let ((p (braid-text-put-proc bt)))
+    (when (process-live-p p) (delete-process p)))
+  (setf (braid-text-put-proc  bt) nil)
+  (setf (braid-text-put-queue bt) "")
+  (braid-unsubscribe (braid-text-sub bt)))
+
+(defun braid-text--reconnect (bt)
+  "Reconnect BT's subscription to recover from a digest mismatch.
+Closes the old subscription and opens a fresh one (no Parents header)
+so the server sends a full snapshot.  Resets version state so the
+snapshot is accepted."
+  (message "Braid: reconnecting to recover from digest mismatch")
+  ;; Close the old subscription
+  (braid-unsubscribe (braid-text-sub bt))
+  ;; Reset version state so the fresh snapshot is accepted
+  (setf (braid-text-current-version bt) nil)
+  (setf (braid-text-prev-state bt) "")
+  ;; Open a new subscription
+  (setf (braid-text-sub bt)
+        (braid-subscribe (braid-text-host bt)
+                         (braid-text-port bt)
+                         (braid-text-path bt)
+                         (lambda (msg) (braid-text--on-message bt msg))
+                         :peer          (braid-text-peer bt)
+                         :tls           (braid-text-tls bt)
+                         :extra-headers '(("Merge-Type" . "simpleton")))))
+
+
+;;;; ======================================================================
+;;;; Persistent PUT connection (private)
+;;;; ======================================================================
+
+(defun braid-text--put-proc-open (bt)
+  "Open a persistent TCP/TLS connection to BT's host:port for pipelining PUTs.
+Returns the process.  No HTTP request is sent on this connection — it is a raw
+socket that we write PUT request bytes onto directly."
+  (braid-http--make-process
+   (format "braid-put:%s:%d%s"
+           (braid-text-host bt) (braid-text-port bt) (braid-text-path bt))
+   (braid-text-host bt)
+   (braid-text-port bt)
+   (braid-text-tls  bt)
+   ;; Filter: consume and discard 200 OK responses so the socket stays healthy.
+   (lambda (_proc _data) nil)
+   ;; Sentinel: flush queued requests on open; reconnect on unexpected close.
+   (lambda (proc event)
+     (cond
+      ((string-prefix-p "open" event)
+       (let ((queued (braid-text-put-queue bt)))
+         (setf (braid-text-put-queue bt) "")
+         (unless (string-empty-p queued)
+           (process-send-string proc queued))))
+      ((or (string-prefix-p "finished" event)
+           (string-prefix-p "deleted"  event))
+       nil)  ; closed intentionally
+      (t
+       ;; Unexpected disconnect — reconnect after a brief pause.
+       (run-with-timer 1.0 nil #'braid-text--put-proc-reconnect bt))))
+   'nowait))
+
+(defun braid-text--put-proc-reconnect (bt)
+  "Reconnect BT's put-proc after a disconnect.
+Clears the put-queue because queued requests had their versions optimistically
+advanced; stale requests with old parents would be rejected by the server."
+  (setf (braid-text-put-queue bt) "")
+  (setf (braid-text-put-proc  bt) (braid-text--put-proc-open bt)))
+
+
+;;;; ======================================================================
+;;;; Subscription callback (private)
+;;;; ======================================================================
+
+(defun braid-text--repr-digest (text)
+  "Compute the repr-digest of TEXT (UTF-8 SHA-256, base64, braid wire format)."
+  (let* ((bytes (encode-coding-string text 'utf-8))
+         (hash  (secure-hash 'sha256 bytes nil nil t)))
+    (format "sha-256=:%s:" (base64-encode-string hash t))))
+
+(defun braid-text--on-message (bt msg)
+  "Handle an incoming subscription message for BT."
+  (let* ((version (plist-get msg :version))
+         (parents (sort (copy-sequence (plist-get msg :parents)) #'string<))
+         (patches (plist-get msg :patches))
+         (body    (plist-get msg :body))
+         (headers (plist-get msg :headers)))
+    (when braid-text-debug
+      (message "Braid: recv version=%s parents=%s cur=%s match=%s patches=%d body=%s"
+               version parents (braid-text-current-version bt)
+               (equal parents (braid-text-current-version bt))
+               (length (or patches '()))
+               (if body (format "%dchars" (length body)) "nil")))
+    ;; Simpleton: only accept if parents == our current-version
+    (when (equal parents (braid-text-current-version bt))
+      (let ((before (when braid-text-debug (braid-text--buffer-text bt))))
+        (condition-case err
+            (progn
+              (if patches
+                  (braid-text--apply-patches bt patches)
+                ;; Full body (initial snapshot or full replacement)
+                (braid-text--set-buffer-text bt (or body "")))
+              ;; Advance version only after the apply succeeds, so a crash here
+              ;; does not silently advance the version and cause divergence.
+              (setf (braid-text-current-version bt)
+                    (sort (copy-sequence version) #'string<))
+              ;; Verify integrity if the server sent a repr-digest.
+              (when-let ((expected (cdr (assoc "repr-digest" headers))))
+                (let ((actual (braid-text--repr-digest (braid-text--buffer-text bt))))
+                  (unless (equal actual expected)
+                    (message "Braid: DIGEST MISMATCH after version %s — reconnecting"
+                             version)
+                    ;; Schedule reconnect on next event loop iteration
+                    ;; (not inside the process filter).
+                    (run-with-timer 0.1 nil #'braid-text--reconnect bt)))))
+          (error
+           (message "Braid: failed to apply update (version %s): %S" version err)))))))
+
+
+;;;; ======================================================================
+;;;; Buffer helpers (private)
+;;;; ======================================================================
+
+(defun braid-text--buffer-text (bt)
+  "Return the full text of BT's buffer as a string."
+  (with-current-buffer (braid-text-buffer bt)
+    (buffer-substring-no-properties (point-min) (point-max))))
+
+(defun braid-text--adjust-point (pos start end new-len)
+  "Adjust 0-indexed char offset POS for a patch replacing [START,END) with NEW-LEN chars.
+If POS is after the region it shifts by the net delta.
+If POS is inside the region it is clamped to START.
+If POS is at or before START it is unchanged."
+  (cond
+   ((>= pos end)  (+ pos (- new-len (- end start))))
+   ((> pos start) start)
+   (t             pos)))
+
+(defun braid-text--with-saved-points (buf thunk)
+  "Call THUNK with BUF as current buffer, then restore each window's point.
+Before calling THUNK, saves the 0-indexed point offset for every window
+displaying BUF.  After THUNK returns the saved offsets (already adjusted
+by THUNK via `braid-text--adjust-point') are written back."
+  ;; Capture offsets before any edits.
+  (let* ((base    (with-current-buffer buf (point-min)))
+         (windows (get-buffer-window-list buf nil t))
+         (saved   (mapcar (lambda (w) (cons w (- (window-point w) base)))
+                          windows))
+         ;; THUNK may update `saved' in place; return the final offsets.
+         (result  (funcall thunk saved)))
+    ;; Recompute base in case erase-buffer changed it (narrowing is rare but safe).
+    (let ((new-base (with-current-buffer buf (point-min))))
+      (dolist (ws result)
+        (set-window-point (car ws) (+ new-base (cdr ws)))))))
+
+(defun braid-text--set-buffer-text (bt text)
+  "Replace BT's buffer content with TEXT, suppressing change hooks."
+  (let ((buf (braid-text-buffer bt)))
+    (braid-text--with-saved-points
+     buf
+     (lambda (saved)
+       (with-current-buffer buf
+         (let* ((new-len             (length text))
+                (inhibit-modification-hooks t))
+           (erase-buffer)
+           (insert text)
+           (set-buffer-modified-p nil)
+           (when buffer-file-name (set-visited-file-modtime))
+           ;; Clamp each saved point to the new buffer length.
+           (mapcar (lambda (ws)
+                     (cons (car ws) (min (cdr ws) new-len)))
+                   saved)))))
+    (setf (braid-text-prev-state bt) text)))
+
+(defun braid-text--adjust-point-absolute (pos patches)
+  "Adjust 0-indexed char offset POS for absolute-coordinate PATCHES.
+PATCHES must be sorted ascending by start and non-overlapping.
+Each patch replaces [start,end) in the original text with its body."
+  (let ((cum-delta 0))
+    (catch 'done
+      (dolist (p patches)
+        (let* ((cr    (plist-get p :content-range))
+               (start (nth 1 cr))
+               (end   (nth 2 cr))
+               (new-len (length (plist-get p :body)))
+               (delta (- new-len (- end start))))
+          (when (< pos start)
+            (throw 'done nil))
+          (when (< pos end)
+            (setq pos start)
+            (throw 'done nil))
+          (cl-incf cum-delta delta))))
+    (+ pos cum-delta)))
+
+(defun braid-text--apply-patches (bt patches)
+  "Apply subscription PATCHES to BT's buffer, suppressing change hooks.
+Patches use absolute coordinates (all relative to the original state
+before any patches in this block).  They are sorted ascending by start
+position and applied left-to-right with a cumulative offset to account
+for shifts from preceding patches."
+  ;; Filter out no-op patches (nil content-range, empty body) that the server
+  ;; sends when a concurrent edit is fully subsumed during rebase.
+  (setq patches (cl-remove-if
+                 (lambda (p)
+                   (and (null (plist-get p :content-range))
+                        (let ((body (plist-get p :body)))
+                          (or (null body) (string-empty-p body)))))
+                 patches))
+  ;; Sort ascending by start position (protocol does not guarantee order).
+  (setq patches (sort patches
+                      (lambda (a b)
+                        (< (nth 1 (plist-get a :content-range))
+                           (nth 1 (plist-get b :content-range))))))
+  (let ((buf (braid-text-buffer bt)))
+    (braid-text--with-saved-points
+     buf
+     (lambda (saved)
+       (with-current-buffer buf
+         (let ((inhibit-modification-hooks t)
+               (offset 0))
+           ;; Apply left-to-right, tracking cumulative offset from prior patches.
+           (dolist (p patches)
+             (let* ((cr      (plist-get p :content-range))
+                    (start   (+ (nth 1 cr) offset))
+                    (end     (+ (nth 2 cr) offset))
+                    (content (plist-get p :body)))
+               (delete-region (+ (point-min) start)
+                              (+ (point-min) end))
+               (goto-char (+ (point-min) start))
+               (insert content)
+               (cl-incf offset (- (length content) (- end start)))))))
+       ;; Adjust cursor positions using absolute coordinates.
+       ;; Patches are sorted ascending; walk them once per cursor.
+       (let ((result
+              (mapcar (lambda (ws)
+                        (cons (car ws)
+                              (braid-text--adjust-point-absolute
+                               (cdr ws) patches)))
+                      saved)))
+         (with-current-buffer buf
+           (set-buffer-modified-p nil)
+           (when buffer-file-name (set-visited-file-modtime)))
+         result)))
+    (setf (braid-text-prev-state bt)
+          (braid-text--buffer-text bt))))
+
+
+;;;; ======================================================================
+;;;; Diff helper (private)
+;;;; ======================================================================
+
+(defun braid-text--simple-diff (old new)
+  "Return a single-patch plist (:start S :end E :content C) diffing OLD → NEW.
+Finds the longest common prefix and suffix and returns the minimal middle edit."
+  (let* ((olen   (length old))
+         (nlen   (length new))
+         (minlen (min olen nlen))
+         (p 0)
+         (s 0))
+    ;; Common prefix
+    (while (and (< p minlen) (eq (aref old p) (aref new p)))
+      (cl-incf p))
+    ;; Common suffix (only within the non-prefix portion)
+    (let ((maxs (- minlen p)))
+      (while (and (< s maxs)
+                  (eq (aref old (- olen s 1)) (aref new (- nlen s 1))))
+        (cl-incf s)))
+    (list :start   p
+          :end     (- olen s)
+          :content (substring new p (- nlen s)))))
+
+
+(provide 'braid-text)
+;;; braid-text.el ends here

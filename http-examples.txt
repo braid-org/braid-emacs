@@ -1,0 +1,159 @@
+;;;; Braid-HTTP Wire Format Examples
+;;;; Used as a reference spec for the braid-http.el implementation.
+;;;;
+;;;; Protocol overview:
+;;;;  - Client GETs with "Subscribe: true" → server keeps connection open
+;;;;  - Server responds with "209 MULTIRESPONSE"
+;;;;  - The 209 body is a stream of updates (possibly with Transfer-Encoding: chunked)
+;;;;  - Each update has HTTP-style headers then a body
+;;;;  - Client PUTs with Version/Parents/Patches to send local edits
+;;;;  - Simpleton merge-type uses Merge-Type: simpleton header
+;;;;
+;;;; All version values are lists of strings separated by ", ".
+;;;; Patch ranges use Unicode code-point indices (not byte indices).
+
+
+;;; ============================================================
+;;; 1. GET SUBSCRIPTION REQUEST
+;;; ============================================================
+
+GET /test HTTP/1.1
+Host: 127.0.0.1:8888
+Subscribe: true
+Peer: a3f9b2
+Accept: text/plain
+
+
+;;; ============================================================
+;;; 2. 209 MULTIRESPONSE (server's response)
+;;; ============================================================
+;;; The HTTP response headers arrive once.
+;;; The body is a never-ending stream of updates.
+;;; Node.js will send this with Transfer-Encoding: chunked.
+
+HTTP/1.1 209 Multiresponse
+Transfer-Encoding: chunked
+Content-Type: text/plain
+
+;;; ---- 2a. First update: full snapshot (no Parents header in GET) ----
+;;;
+;;; After the HTTP response headers (ending \r\n\r\n), the first
+;;; update response begins immediately with a 200 OK.
+;;; Then the headers come.
+;;;
+;;; Format: [status-line]\r\n[update-headers]\r\n\r\n[body of Content-Length bytes]
+
+200 OK
+Version: "server-0"
+Parents: "root"
+Content-Length: 13
+
+Hello, world!
+
+;;; ---- 2b. Second update: a patch from another client ----
+;;;
+;;; Immediately after the 13 bytes of "Hello, world!", the next
+;;; update starts. No separator needed — Content-Length told us exactly
+;;; how many bytes the previous body had.
+
+200 OK
+Version: "other-client-20"
+Parents: "server-0"
+Content-Length: 5
+Content-Range: text [7:12]
+
+world
+
+200 OK
+Version: "other-client-40"
+Parents: "other-client-20"
+Content-Length: 2
+Content-Range: text [0:5]
+
+Hi
+
+200 OK
+Content-Length: 0
+Content-Range: text [9:13]
+
+
+;;; ---- 2c. Heartbeat (empty update, no body) ----
+;;; Servers may send periodic heartbeats to keep the connection alive.
+;;; These are just blank lines \r\n.
+
+
+
+
+;;; ============================================================
+;;; 3. PUT REQUEST (client sending a local edit)
+;;; ============================================================
+;;; The client sends patches using version/parents it last received.
+;;; Merge-Type: simpleton tells the server which CRDT to use.
+;;;
+;;; Version format: "peer-charcount" where charcount is a running
+;;; total of code points deleted + inserted by this peer.
+
+PUT /test HTTP/1.1
+Host: 127.0.0.1:8888
+Content-Type: text/plain
+Merge-Type: simpleton
+Peer: a3f9b2
+Version: "a3f9b2-7"
+Parents: "server-0"
+Content-Length: 7
+Content-Range: text [7:12]
+
+WORLD!!
+
+;;; ============================================================
+;;; 4. SERVER'S RESPONSE TO PUT
+;;; ============================================================
+
+HTTP/1.1 200 OK
+
+
+;;; ============================================================
+;;; 5. WHAT THE SERVER ECHOES BACK ON THE SUBSCRIPTION STREAM
+;;; ============================================================
+;;; After the PUT is accepted, the server echoes the update back to all
+;;; subscribers (including the sender, though the sender can ignore its
+;;; own peer's versions). This appears in the 209 body stream:
+
+200 OK
+Version: "a3f9b2-7"
+Parents: "server-0"
+Content-Length: 7
+Content-Range: text [7:12]
+
+WORLD!!
+
+;;; ============================================================
+;;; 6. SIMPLETON VERSIONING SCHEME
+;;; ============================================================
+;;; Version strings: "<peer-id>-<char-counter>"
+;;;   peer-id:      random hex string generated once per client session
+;;;   char-counter: running sum of (code-points-deleted + code-points-inserted)
+;;;                 for all patches sent by this peer
+;;;
+;;; Example sequence for peer "a3f9b2" editing "Hello, world!":
+;;;   Initial state: "Hello, world!"   (char-counter = 0)
+;;;   Replace "world" [7:12] with "WORLD!!":
+;;;     deleted = 5 code points, inserted = 7 code points → counter += 12
+;;;     version = ["a3f9b2-12"]
+;;;   Replace "Hello" [0:5] with "Hi":
+;;;     deleted = 5, inserted = 2 → counter += 7
+;;;     version = ["a3f9b2-19"]
+
+;;; ============================================================
+;;; 7. INITIAL SUBSCRIPTION WITH PARENTS (reconnect scenario)
+;;; ============================================================
+;;; If we already have version "server-0" and reconnect, we send:
+
+GET /test HTTP/1.1
+Host: 127.0.0.1:8888
+Subscribe: true
+Merge-Type: simpleton
+Peer: a3f9b2
+Parents: "server-0"
+
+;;; The server then sends only updates AFTER "server-0", not the full state.

@@ -1,0 +1,17 @@
+# Emacs
+*.elc
+*~
+\#*\#
+.\#*
+
+# braid-text server data
+braid-text-db/
+
+# Node.js test dependencies
+test-server/node_modules/
+
+# Claude Code
+.claude/
+
+# macOS
+.DS_Store
