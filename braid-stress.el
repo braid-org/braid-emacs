@@ -30,7 +30,7 @@
 (defun braid-stress--add-latency (bt delay)
   "Add DELAY seconds of latency to BT's subscription receive path."
   (let* ((sub  (braid-text-sub bt))
-         (proc (braid-sub-process sub))
+         (proc (braid-http-sub-process sub))
          (orig (process-filter proc)))
     (set-process-filter
      proc

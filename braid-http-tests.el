@@ -22,7 +22,7 @@
 Bypasses the outer HTTP headers and dechunking — body-str is fed directly
 into the sub-headers parser, simulating what arrives after dechunking."
   (let (messages)
-    (let ((sub (make-braid-sub
+    (let ((sub (make-braid-http-sub
                 :host "127.0.0.1" :port 8888 :path "/test"
                 :stage :sub-headers
                 :body-buf body-str
@@ -289,14 +289,14 @@ into the sub-headers parser, simulating what arrives after dechunking."
                               "\r\n"
                               "hello"))
          messages
-         (sub (make-braid-sub
+         (sub (make-braid-http-sub
                :host "127.0.0.1" :port 8888 :path "/test"
                :stage :sub-headers
                :on-message (lambda (m) (push m messages)))))
     ;; Feed one byte at a time
     (dotimes (i (length full-stream))
-      (setf (braid-sub-body-buf sub)
-            (concat (braid-sub-body-buf sub)
+      (setf (braid-http-sub-body-buf sub)
+            (concat (braid-http-sub-body-buf sub)
                     (substring full-stream i (1+ i))))
       (braid-http--pump sub))
     (setq messages (nreverse messages))
@@ -403,7 +403,7 @@ Prints PASS/FAIL for each step and exits with code 0 or 1."
   (let* ((path     (format "/braid-test-%x" (random #xffffff)))
          (messages nil)
          (fail     nil)
-         (sub      (braid-subscribe
+         (sub      (braid-http-subscribe
                     "127.0.0.1" 8888 path
                     (lambda (msg) (push msg messages)))))
 

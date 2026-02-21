@@ -6,22 +6,11 @@
 ;; URL: https://github.com/braid-org/braid-emacs
 ;; Keywords: comm, tools
 
-;;
+;;; Commentary:
+
 ;; Implements the simpleton sync algorithm on top of braid-http.el.
-;; Connects an Emacs buffer to a braid-text server resource.
-;;
-;; Public API:
-;;   (braid-text-open HOST PORT PATH BUFFER)  → braid-text struct
-;;   (braid-text-buffer-changed BT)           ; call from after-change-functions
-;;   (braid-text-close BT)
-;;
-;; Usage sketch (see braid-mode.el for the full Emacs integration):
-;;
-;;   (setq bt (braid-text-open "127.0.0.1" 8888 "/text/doc" (current-buffer)))
-;;   ;; ... make some edits, then:
-;;   (braid-text-buffer-changed bt)
-;;   ;; ... later:
-;;   (braid-text-close bt)
+;; Connects an Emacs buffer to a braid-text server resource and handles
+;; diffing, patching, version tracking, and digest verification.
 
 ;;; Code:
 
@@ -46,7 +35,7 @@
   (put-proc        nil)    ; persistent network process for pipelining PUTs
   (put-queue       "")     ; raw PUT request bytes queued while put-proc is connecting
   (pending-puts    0)      ; number of PUTs sent but not yet acked by server
-  sub)                     ; braid-sub handle
+  sub)                     ; braid-http-sub handle
 
 
 ;;;; ======================================================================
@@ -66,7 +55,7 @@ is locally edited, and to `braid-text-close' to disconnect."
                                 :buffer buffer
                                 :tls    tls)))
     (setf (braid-text-sub bt)
-          (braid-subscribe host port path
+          (braid-http-subscribe host port path
                            (lambda (msg) (braid-text--on-message bt msg))
                            :peer          peer
                            :tls           tls
@@ -119,7 +108,7 @@ The PUT is sent immediately on the persistent put-proc connection (pipelined)."
     (when (process-live-p p) (delete-process p)))
   (setf (braid-text-put-proc  bt) nil)
   (setf (braid-text-put-queue bt) "")
-  (braid-unsubscribe (braid-text-sub bt)))
+  (braid-http-unsubscribe (braid-text-sub bt)))
 
 (defun braid-text--reconnect (bt)
   "Reconnect BT's subscription to recover from a digest mismatch.
@@ -128,13 +117,13 @@ so the server sends a full snapshot.  Resets version state so the
 snapshot is accepted."
   (message "Braid: reconnecting to recover from digest mismatch")
   ;; Close the old subscription
-  (braid-unsubscribe (braid-text-sub bt))
+  (braid-http-unsubscribe (braid-text-sub bt))
   ;; Reset version state so the fresh snapshot is accepted
   (setf (braid-text-current-version bt) nil)
   (setf (braid-text-prev-state bt) "")
   ;; Open a new subscription
   (setf (braid-text-sub bt)
-        (braid-subscribe (braid-text-host bt)
+        (braid-http-subscribe (braid-text-host bt)
                          (braid-text-port bt)
                          (braid-text-path bt)
                          (lambda (msg) (braid-text--on-message bt msg))
@@ -218,7 +207,7 @@ advanced; stale requests with old parents would be rejected by the server."
                (if body (format "%dchars" (length body)) "nil")))
     ;; Simpleton: only accept if parents == our current-version
     (when (equal parents (braid-text-current-version bt))
-      (let ((before (when braid-text-debug (braid-text--buffer-text bt))))
+      (let ((_before (when braid-text-debug (braid-text--buffer-text bt))))
         (condition-case err
             (progn
               (if patches

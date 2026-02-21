@@ -37,7 +37,7 @@
 (cl-defstruct braid-demo-buf
   "State for one synced buffer."
   buffer   ; Emacs buffer object
-  sub      ; braid-sub (also holds the peer ID)
+  sub      ; braid-http-sub (also holds the peer ID)
   name)    ; display label ("A" or "B")
 
 
@@ -114,13 +114,13 @@ it back to this client."
                    "delete"
                  (format "insert %S" (nth 2 edit)))
                (nth 0 edit) (nth 1 edit))
-      (braid-put "127.0.0.1" 8888 path
+      (braid-http-put "127.0.0.1" 8888 path
                  '() '()
                  (list :range   (list :unit  "text"
                                       :start (nth 0 edit)
                                       :end   (nth 1 edit))
                        :content (nth 2 edit))
-                 :peer (braid-sub-peer (braid-demo-buf-sub dbuf))))))
+                 :peer (braid-http-sub-peer (braid-demo-buf-sub dbuf))))))
 
 
 ;;; ── Shared edit loop ─────────────────────────────────────────────────────
@@ -171,10 +171,10 @@ Leaves Emacs open when done — quit with C-x C-c."
 
     ;; Open subscriptions
     (setf (braid-demo-buf-sub da)
-          (braid-subscribe "127.0.0.1" 8888 path
+          (braid-http-subscribe "127.0.0.1" 8888 path
                            (lambda (msg) (braid-demo--on-message da msg))))
     (setf (braid-demo-buf-sub db)
-          (braid-subscribe "127.0.0.1" 8888 path
+          (braid-http-subscribe "127.0.0.1" 8888 path
                            (lambda (msg) (braid-demo--on-message db msg))))
     (sit-for 0.3)
 
@@ -204,10 +204,10 @@ Leaves Emacs open when done — quit with C-x C-c."
     (braid-demo--start-server)
 
     (setf (braid-demo-buf-sub da)
-          (braid-subscribe "127.0.0.1" 8888 path
+          (braid-http-subscribe "127.0.0.1" 8888 path
                            (lambda (msg) (braid-demo--on-message da msg))))
     (setf (braid-demo-buf-sub db)
-          (braid-subscribe "127.0.0.1" 8888 path
+          (braid-http-subscribe "127.0.0.1" 8888 path
                            (lambda (msg) (braid-demo--on-message db msg))))
     (accept-process-output nil 0.3)
 
@@ -218,13 +218,13 @@ Leaves Emacs open when done — quit with C-x C-c."
           (message "PASS: both buffers in sync after 10 edits: %S"
                    (with-current-buffer buf-a
                      (buffer-substring-no-properties (point-min) (point-max))))
-          (braid-unsubscribe (braid-demo-buf-sub da))
-          (braid-unsubscribe (braid-demo-buf-sub db))
+          (braid-http-unsubscribe (braid-demo-buf-sub da))
+          (braid-http-unsubscribe (braid-demo-buf-sub db))
           (kill-emacs 0))
       (error
        (message "FAIL: %s" (error-message-string err))
-       (braid-unsubscribe (braid-demo-buf-sub da))
-       (braid-unsubscribe (braid-demo-buf-sub db))
+       (braid-http-unsubscribe (braid-demo-buf-sub da))
+       (braid-http-unsubscribe (braid-demo-buf-sub db))
        (kill-emacs 1)))))
 
 (provide 'braid-demo)

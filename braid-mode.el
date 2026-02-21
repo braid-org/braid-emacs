@@ -6,18 +6,13 @@
 ;; URL: https://github.com/braid-org/braid-emacs
 ;; Keywords: comm, tools
 
-;;
+;;; Commentary:
+
 ;; A minor mode that keeps an Emacs buffer in sync with a braid-text
 ;; server resource using the simpleton merge algorithm.
 ;;
-;; Usage:
-;;
-;;   M-x braid-connect   — prompts for host, port, path; enables sync
-;;   M-x braid-mode      — toggle (disabling closes the connection)
-;;
-;; Or from Lisp:
-;;
-;;   (braid-connect "127.0.0.1" 8888 "/text/my-doc")
+;; Use `braid-connect' to connect any buffer, or open files under
+;; `~/http/' for automatic braidfs integration via `braid-live'.
 
 ;;; Code:
 
@@ -75,7 +70,7 @@ and ** when disconnected."
   (setq-local mode-line-modified
               '(:eval (cond
                        ((null braid-mode--bt) "○○")
-                       ((not (eq (braid-sub-status (braid-text-sub braid-mode--bt))
+                       ((not (eq (braid-http-sub-status (braid-text-sub braid-mode--bt))
                                  :connected))
                         "**")
                        ((> (braid-text-pending-puts braid-mode--bt) 0)
@@ -202,7 +197,7 @@ is applied to the buffer once the subscription is established."
     (setq braid-mode--bt nil))
   (braid-mode 1)
   (setq braid-mode--bt (braid-text-open host port path (current-buffer) :tls tls))
-  (message "Braid: connecting to %s://%s%s" (if tls "https" "http") host
+  (message "Braid: connecting to %s://%s%s%s" (if tls "https" "http") host
            (if (or (and tls (= port 443)) (and (not tls) (= port 80)))
                ""
              (format ":%d" port))
