@@ -37,6 +37,16 @@
   :type 'integer
   :group 'braid)
 
+(defcustom braid-reconnect-max-delay-foreground 3.0
+  "Max reconnect backoff (seconds) for braid buffers displayed in the selected window."
+  :type 'number
+  :group 'braid)
+
+(defcustom braid-reconnect-max-delay-background 120.0
+  "Max reconnect backoff (seconds) for braid buffers not displayed in the selected window."
+  :type 'number
+  :group 'braid)
+
 
 ;;;; ======================================================================
 ;;;; Buffer-local state
@@ -44,6 +54,12 @@
 
 (defvar-local braid-mode--bt nil
   "The `braid-text' struct syncing this buffer, or nil if not connected.")
+
+(defvar-local braid-mode--ever-connected nil
+  "Non-nil once the subscription has received a successful 209 response.")
+
+(defvar-local braid-mode--tls-fallback-tried nil
+  "Non-nil if we already tried flipping TLS/plain to prevent infinite loops.")
 
 (defvar-local braid-mode--saved-auto-save-name nil
   "Saved `buffer-auto-save-file-name' restored when `braid-mode' is disabled.")
@@ -64,6 +80,22 @@
 
 (defvar-local braid-mode--saved-mode-line-modified nil
   "Saved `mode-line-modified' value restored when `braid-mode' is disabled.")
+
+(defun braid-mode--on-window-selection-change (_frame)
+  "Adjust reconnect-max-delay for braid buffers based on window focus.
+Foreground buffers get a short cap; background buffers get a long one.
+If a disconnected buffer is newly focused, expedite its reconnect."
+  (dolist (buf (buffer-list))
+    (when (buffer-local-value 'braid-mode--bt buf)
+      (let* ((bt  (buffer-local-value 'braid-mode--bt buf))
+             (sub (braid-text-sub bt))
+             (focused (eq buf (window-buffer (selected-window))))
+             (max-d (if focused
+                        braid-reconnect-max-delay-foreground
+                      braid-reconnect-max-delay-background)))
+        (setf (braid-http-sub-reconnect-max-delay sub) max-d)
+        (when focused
+          (braid-http-expedite-reconnect sub))))))
 
 (defun braid-mode--install-indicator ()
   "Replace `mode-line-modified' with the braid status indicator.
@@ -110,12 +142,14 @@ to the buffer.  This is expected and not a real conflict."
   (when braid-mode--bt
     (braid-text-close braid-mode--bt)
     (setq braid-mode--bt nil))
-  ;; Remove supersession advice if no other braid-mode buffers remain.
+  ;; Remove global hooks/advice if no other braid-mode buffers remain.
   (unless (cl-some (lambda (b) (and (not (eq b (current-buffer)))
                                     (buffer-local-value 'braid-mode b)))
                    (buffer-list))
     (advice-remove 'ask-user-about-supersession-threat
-                   #'braid-mode--suppress-supersession)))
+                   #'braid-mode--suppress-supersession)
+    (remove-hook 'window-selection-change-functions
+                 #'braid-mode--on-window-selection-change)))
 
 ;;;###autoload
 (define-minor-mode braid-mode
@@ -127,6 +161,9 @@ Enable with `braid-connect'; disable to close the connection."
       (progn
         (add-hook 'after-change-functions #'braid-mode--after-change nil t)
         (add-hook 'kill-buffer-hook #'braid-mode--on-kill nil t)
+        ;; Install focus-change hook (global, shared by all braid buffers).
+        (add-hook 'window-selection-change-functions
+                  #'braid-mode--on-window-selection-change)
         ;; Insert indicator near the left of the mode line, after mode-line-modified.
         (braid-mode--install-indicator)
         ;; Suppress "file changed on disk" warnings — braidfs updates the
@@ -152,12 +189,14 @@ Enable with `braid-connect'; disable to close the connection."
     (remove-hook 'kill-buffer-hook #'braid-mode--on-kill t)
     ;; Remove indicator from mode line.
     (braid-mode--remove-indicator)
-    ;; Remove supersession advice if no other braid-mode buffers need it.
+    ;; Remove global hooks/advice if no other braid-mode buffers remain.
     (unless (cl-some (lambda (b) (and (not (eq b (current-buffer)))
                                       (buffer-local-value 'braid-mode b)))
                      (buffer-list))
       (advice-remove 'ask-user-about-supersession-threat
-                     #'braid-mode--suppress-supersession))
+                     #'braid-mode--suppress-supersession)
+      (remove-hook 'window-selection-change-functions
+                   #'braid-mode--on-window-selection-change))
     ;; Restore auto-revert if it was active before.
     (when braid-mode--saved-auto-revert
       (auto-revert-mode 1))
@@ -199,10 +238,10 @@ the first path component is a dotfile (e.g. .braidfs)."
                  (path-rest  (substring rel slash))
                  (colon      (string-match ":" domain))
                  (host       (if colon (substring domain 0 colon) domain))
-                 (tls        (not colon))
-                 (port       (if colon
-                                 (string-to-number (substring domain (1+ colon)))
-                               443)))
+                 (tls        (not (member host '("localhost" "127.0.0.1" "::1"))))
+                 (port       (cond (colon (string-to-number (substring domain (1+ colon))))
+                                   (tls   443)
+                                   (t     80))))
             (list host port path-rest tls)))))))
 
 ;;;###autoload
@@ -226,6 +265,52 @@ already connected."
 ;;;; Interactive entry point
 ;;;; ======================================================================
 
+(defun braid-mode--on-connect ()
+  "Called when the subscription receives a successful 209 response."
+  (setq braid-mode--ever-connected t))
+
+(defun braid-mode--on-disconnect ()
+  "Called on unexpected disconnect.  Tries TLS fallback if never connected."
+  (when (and (not braid-mode--ever-connected)
+             (not braid-mode--tls-fallback-tried)
+             braid-mode--bt)
+    (setq braid-mode--tls-fallback-tried t)
+    (let* ((bt      braid-mode--bt)
+           (host    (braid-text-host bt))
+           (port    (braid-text-port bt))
+           (old-tls (braid-text-tls bt))
+           (new-tls (not old-tls))
+           (new-port (cond
+                      ;; Flip default ports: 80 ↔ 443
+                      ((and old-tls (= port 443)) 80)
+                      ((and (not old-tls) (= port 80)) 443)
+                      (t port)))
+           (path    (braid-text-path bt))
+           (buf     (current-buffer)))
+      (message "Braid: %s connection failed, trying %s on port %d"
+               (if old-tls "TLS" "plain")
+               (if new-tls "TLS" "plain")
+               new-port)
+      ;; Can't create processes inside a sentinel, so schedule for next event loop.
+      (run-with-timer 0.1 nil
+                      (lambda ()
+                        (when (buffer-live-p buf)
+                          (with-current-buffer buf
+                            (braid-text-close bt)
+                            (setq braid-mode--bt nil)
+                            (setq braid-mode--ever-connected nil)
+                            (setq braid-mode--bt
+                                  (braid-text-open host new-port path buf
+                                                   :tls new-tls
+                                                   :on-connect
+                                                   (lambda ()
+                                                     (with-current-buffer buf
+                                                       (braid-mode--on-connect)))
+                                                   :on-disconnect
+                                                   (lambda ()
+                                                     (with-current-buffer buf
+                                                       (braid-mode--on-disconnect))))))))))))
+
 ;;;###autoload
 (defun braid-connect (host port path &optional tls)
   "Connect the current buffer to a braid-text resource at HOST:PORT/PATH.
@@ -242,8 +327,28 @@ is applied to the buffer once the subscription is established."
   (when braid-mode--bt
     (braid-text-close braid-mode--bt)
     (setq braid-mode--bt nil))
+  ;; Reset fallback state
+  (setq braid-mode--ever-connected nil)
+  (setq braid-mode--tls-fallback-tried nil)
   (braid-mode 1)
-  (setq braid-mode--bt (braid-text-open host port path (current-buffer) :tls tls))
+  (let ((buf (current-buffer)))
+    (setq braid-mode--bt (braid-text-open host port path buf
+                                          :tls tls
+                                          :on-connect
+                                          (lambda ()
+                                            (with-current-buffer buf
+                                              (braid-mode--on-connect)))
+                                          :on-disconnect
+                                          (lambda ()
+                                            (with-current-buffer buf
+                                              (braid-mode--on-disconnect)))))
+    ;; Set initial reconnect cap based on whether this buffer is focused.
+    (let* ((focused (eq buf (window-buffer (selected-window))))
+           (max-d   (if focused
+                        braid-reconnect-max-delay-foreground
+                      braid-reconnect-max-delay-background)))
+      (setf (braid-http-sub-reconnect-max-delay (braid-text-sub braid-mode--bt))
+            max-d)))
   (message "Braid: connecting to %s://%s%s%s" (if tls "https" "http") host
            (if (or (and tls (= port 443)) (and (not tls) (= port 80)))
                ""

@@ -43,11 +43,14 @@
 ;;;; Public API
 ;;;; ======================================================================
 
-(cl-defun braid-text-open (host port path buffer &key tls)
+(cl-defun braid-text-open (host port path buffer &key tls on-connect on-disconnect)
   "Subscribe BUFFER to the braid-text resource at HOST:PORT/PATH.
 Uses the simpleton merge type.  Returns a braid-text struct.
 Pass the struct to `braid-text-buffer-changed' whenever the buffer
-is locally edited, and to `braid-text-close' to disconnect."
+is locally edited, and to `braid-text-close' to disconnect.
+
+ON-CONNECT and ON-DISCONNECT are optional callbacks forwarded to
+`braid-http-subscribe'."
   (let* ((peer (format "%04x%04x" (random #xffff) (random #xffff)))
          (bt   (make-braid-text :host   host
                                 :port   port
@@ -60,6 +63,8 @@ is locally edited, and to `braid-text-close' to disconnect."
                            (lambda (msg) (braid-text--on-message bt msg))
                            :peer          peer
                            :tls           tls
+                           :on-connect    on-connect
+                           :on-disconnect on-disconnect
                            :extra-headers '(("Merge-Type" . "simpleton")
                                              ("Accept"     . "text/plain, text/markdown, text/html, application/json"))))
     (setf (braid-text-put-proc bt) (braid-text--put-proc-open bt))
@@ -118,21 +123,29 @@ Closes the old subscription and opens a fresh one (no Parents header)
 so the server sends a full snapshot.  Resets version state so the
 snapshot is accepted."
   (message "Braid: reconnecting to recover from digest mismatch")
-  ;; Close the old subscription
-  (braid-http-unsubscribe (braid-text-sub bt))
-  ;; Reset version state so the fresh snapshot is accepted
-  (setf (braid-text-current-version bt) nil)
-  (setf (braid-text-prev-state bt) "")
-  ;; Open a new subscription
-  (setf (braid-text-sub bt)
-        (braid-http-subscribe (braid-text-host bt)
-                         (braid-text-port bt)
-                         (braid-text-path bt)
-                         (lambda (msg) (braid-text--on-message bt msg))
-                         :peer          (braid-text-peer bt)
-                         :tls           (braid-text-tls bt)
-                         :extra-headers '(("Merge-Type" . "simpleton")
-                                           ("Accept"     . "text/plain, text/markdown, text/html, application/json")))))
+  ;; Preserve callbacks and max-delay from the old subscription.
+  (let* ((old-sub       (braid-text-sub bt))
+         (on-connect    (braid-http-sub-on-connect old-sub))
+         (on-disconnect (braid-http-sub-on-disconnect old-sub))
+         (max-delay     (braid-http-sub-reconnect-max-delay old-sub)))
+    ;; Close the old subscription
+    (braid-http-unsubscribe old-sub)
+    ;; Reset version state so the fresh snapshot is accepted
+    (setf (braid-text-current-version bt) nil)
+    (setf (braid-text-prev-state bt) "")
+    ;; Open a new subscription
+    (let ((new-sub (braid-http-subscribe (braid-text-host bt)
+                                    (braid-text-port bt)
+                                    (braid-text-path bt)
+                                    (lambda (msg) (braid-text--on-message bt msg))
+                                    :peer          (braid-text-peer bt)
+                                    :tls           (braid-text-tls bt)
+                                    :on-connect    on-connect
+                                    :on-disconnect on-disconnect
+                                    :extra-headers '(("Merge-Type" . "simpleton")
+                                                      ("Accept"     . "text/plain, text/markdown, text/html, application/json")))))
+      (setf (braid-http-sub-reconnect-max-delay new-sub) max-delay)
+      (setf (braid-text-sub bt) new-sub))))
 
 
 ;;;; ======================================================================

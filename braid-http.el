@@ -197,7 +197,8 @@ Returns (new-raw . new-body).  Partial chunks stay in new-raw."
   ;; Reconnection
   (status           :connecting)  ; :connecting | :connected | :disconnected | :closed
   (reconnect-timer  nil)
-  (reconnect-delay  1.0)   ; seconds; doubles on each failure, caps at 30
+  (reconnect-delay  1.0)   ; seconds; doubles on each failure
+  (reconnect-max-delay 30.0) ; upper bound for reconnect-delay
   (extra-headers    nil)   ; alist: extra GET headers (preserved across reconnects)
   (last-parents     nil)   ; list of strings: sent as Parents on reconnect
   ;; Callbacks
@@ -468,14 +469,25 @@ the SENTINEL will be called with an \"open\" event when ready."
   "Schedule a reconnect for SUB with exponential backoff."
   (when (braid-http-sub-reconnect-timer sub)
     (cancel-timer (braid-http-sub-reconnect-timer sub)))
-  (let ((delay (braid-http-sub-reconnect-delay sub)))
-    (setf (braid-http-sub-reconnect-delay sub) (min 30.0 (* delay 2.0)))
+  (let* ((max-delay (braid-http-sub-reconnect-max-delay sub))
+         (delay     (min max-delay (braid-http-sub-reconnect-delay sub))))
+    (setf (braid-http-sub-reconnect-delay sub) (min max-delay (* delay 2.0)))
     (setf (braid-http-sub-reconnect-timer sub)
           (run-with-timer
            delay nil
            (lambda ()
              (when (not (eq (braid-http-sub-status sub) :closed))
                (braid-http--open sub (braid-http-sub-last-parents sub))))))))
+
+(defun braid-http-expedite-reconnect (sub)
+  "If SUB is disconnected, cancel its pending timer and reconnect immediately.
+Resets the backoff delay to 1.0.  No-op if SUB is not disconnected."
+  (when (eq (braid-http-sub-status sub) :disconnected)
+    (when (braid-http-sub-reconnect-timer sub)
+      (cancel-timer (braid-http-sub-reconnect-timer sub))
+      (setf (braid-http-sub-reconnect-timer sub) nil))
+    (setf (braid-http-sub-reconnect-delay sub) 1.0)
+    (braid-http--open sub (braid-http-sub-last-parents sub))))
 
 
 ;;;; ======================================================================

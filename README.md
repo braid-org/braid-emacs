@@ -10,6 +10,15 @@ braid-emacs syncs Emacs buffers with HTTP resources using the
 over raw TCP (or TLS) and speaks Braid-HTTP natively — no browser or
 middleware required.
 
+## Setup
+
+Add to your Emacs init:
+
+```elisp
+(add-to-list 'load-path "~/path/to/braid-emacs")
+(require 'braid-mode)
+```
+
 ### Live mode with braidfs
 
 The easiest way to use braid-emacs is with
@@ -45,15 +54,6 @@ M-x braid-connect
 ```
 
 This prompts for host, port, and path.
-
-## Setup
-
-Add to your Emacs init:
-
-```elisp
-(add-to-list 'load-path "~/path/to/braid-emacs")
-(require 'braid-mode)
-```
 
 ## Libraries
 
