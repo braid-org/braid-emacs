@@ -518,8 +518,8 @@ into the sub-headers parser, simulating what arrives after dechunking."
         (cancel-timer (braid-text-put-ack-timer bt)))
       (kill-buffer buf))))
 
-(ert-deftest braid-put-ack/connection-dead-resets-state ()
-  "braid-text--connection-dead resets pending-puts and triggers reconnect."
+(ert-deftest braid-put-ack/connection-dead-triggers-reconnect ()
+  "braid-text--connection-dead triggers reconnect."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (sub (make-braid-http-sub
                :host "127.0.0.1" :port 8888 :path "/test"
@@ -532,13 +532,9 @@ into the sub-headers parser, simulating what arrives after dechunking."
                :sub sub))
          (reconnect-called nil))
     (unwind-protect
-        (cl-letf (((symbol-function 'braid-text--put-proc-reconnect)
-                   (lambda (_bt) nil))
-                  ((symbol-function 'braid-text--reconnect)
+        (cl-letf (((symbol-function 'braid-text--reconnect)
                    (lambda (_bt) (setq reconnect-called t))))
           (braid-text--connection-dead bt)
-          (should (= (braid-text-pending-puts bt) 0))
-          (should (null (braid-text-put-ack-timer bt)))
           (should reconnect-called))
       (when (braid-text-put-ack-timer bt)
         (cancel-timer (braid-text-put-ack-timer bt)))
@@ -566,11 +562,11 @@ into the sub-headers parser, simulating what arrives after dechunking."
 
 
 ;;;; ======================================================================
-;;;; Local edit preservation across reconnect
+;;;; Reconnect behavior
 ;;;; ======================================================================
 
-(ert-deftest braid-reconnect/saves-local-text ()
-  "braid-text--reconnect saves buffer text before resetting version."
+(ert-deftest braid-reconnect/preserves-current-version ()
+  "braid-text--reconnect does NOT reset current-version."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (sub (make-braid-http-sub
                :host "127.0.0.1" :port 8888 :path "/test"
@@ -585,21 +581,73 @@ into the sub-headers parser, simulating what arrives after dechunking."
         (progn
           (with-current-buffer buf (insert "hello world"))
           (cl-letf (((symbol-function 'braid-http-subscribe)
-                     (lambda (&rest _) sub)))
+                     (lambda (&rest _) sub))
+                    ((symbol-function 'braid-text--put-proc-open)
+                     (lambda (_bt) nil)))
             (braid-text--reconnect bt))
-          (should (equal (braid-text-saved-local-text bt) "hello world"))
-          (should (null (braid-text-current-version bt))))
+          ;; Version is preserved (not reset to nil)
+          (should (equal (braid-text-current-version bt) '("v0")))
+          ;; pending-puts reset to 0
+          (should (= (braid-text-pending-puts bt) 0)))
       (kill-buffer buf))))
 
-(ert-deftest braid-reconnect/flush-suppressed-while-saved ()
-  "Flushes are suppressed while saved-local-text is set."
+(ert-deftest braid-reconnect/resets-pending-puts ()
+  "braid-text--reconnect resets pending-puts and cancels ACK timer."
+  (let* ((buf (generate-new-buffer " *braid-test*"))
+         (sub (make-braid-http-sub
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test"))
+         (bt  (make-braid-text
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test" :buffer buf
+               :pending-puts 5
+               :put-ack-timer (run-with-timer 999 nil #'ignore)
+               :current-version '("v0")
+               :prev-state "hello"
+               :sub sub)))
+    (unwind-protect
+        (cl-letf (((symbol-function 'braid-http-subscribe)
+                   (lambda (&rest _) sub))
+                  ((symbol-function 'braid-text--put-proc-open)
+                   (lambda (_bt) nil)))
+          (braid-text--reconnect bt)
+          (should (= (braid-text-pending-puts bt) 0))
+          (should (null (braid-text-put-ack-timer bt))))
+      (when (braid-text-put-ack-timer bt)
+        (cancel-timer (braid-text-put-ack-timer bt)))
+      (kill-buffer buf))))
+
+;;;; ======================================================================
+;;;; PUT throttling
+;;;; ======================================================================
+
+(ert-deftest braid-throttle/flush-suppressed-at-max ()
+  "Flushes are suppressed when pending-puts >= max-outstanding-puts."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
                :prev-state "old"
                :current-version '("v0")
-               :saved-local-text "local edits")))
+               :pending-puts 10
+               :max-outstanding-puts 10)))
+    (unwind-protect
+        (progn
+          (with-current-buffer buf (insert "new text"))
+          (braid-text--flush bt)
+          ;; No PUT should have been sent — still at 10
+          (should (= (braid-text-pending-puts bt) 10)))
+      (kill-buffer buf))))
+
+(ert-deftest braid-throttle/flush-suppressed-when-muted ()
+  "Flushes are suppressed during 503 backpressure mute period."
+  (let* ((buf (generate-new-buffer " *braid-test*"))
+         (bt  (make-braid-text
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test" :buffer buf
+               :prev-state "old"
+               :current-version '("v0")
+               :muted-until (+ (float-time) 60.0))))
     (unwind-protect
         (progn
           (with-current-buffer buf (insert "new text"))
@@ -608,58 +656,21 @@ into the sub-headers parser, simulating what arrives after dechunking."
           (should (= (braid-text-pending-puts bt) 0)))
       (kill-buffer buf))))
 
-(ert-deftest braid-reconnect/snapshot-preserves-local-edits ()
-  "When snapshot arrives after reconnect, buffer keeps local text and flushes diff."
+(ert-deftest braid-throttle/mute-clears-after-expiry ()
+  "Mute is cleared when the mute time has passed."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
-               :current-version nil
-               :prev-state ""
-               :saved-local-text "hello world")))
-    (with-current-buffer buf (insert "hello world"))
+               :prev-state "old"
+               :current-version '("v0")
+               :muted-until (- (float-time) 1.0))))
     (unwind-protect
         (progn
-          ;; Simulate receiving a snapshot from the server
-          (braid-text--on-message bt
-            (list :version '("server-v1")
-                  :parents nil
-                  :patches nil
-                  :body "hello"
-                  :headers '(("content-type" . "text/plain"))))
-          ;; Buffer should still have the local text
-          (should (equal (braid-text--buffer-text bt) "hello world"))
-          ;; prev-state should be updated to buffer text (flush ran)
-          (should (equal (braid-text-prev-state bt) "hello world"))
-          ;; saved-local-text should be cleared
-          (should (null (braid-text-saved-local-text bt)))
-          ;; A PUT should have been flushed (diff of "hello" → "hello world")
-          (should (= (braid-text-pending-puts bt) 1)))
-      (when (braid-text-put-ack-timer bt)
-        (cancel-timer (braid-text-put-ack-timer bt)))
-      (kill-buffer buf))))
-
-(ert-deftest braid-reconnect/no-flush-when-identical ()
-  "No PUT is sent if local text matches the server snapshot."
-  (let* ((buf (generate-new-buffer " *braid-test*"))
-         (bt  (make-braid-text
-               :host "127.0.0.1" :port 8888 :path "/test"
-               :peer "test" :buffer buf
-               :current-version nil
-               :prev-state ""
-               :saved-local-text "hello")))
-    (with-current-buffer buf (insert "hello"))
-    (unwind-protect
-        (progn
-          (braid-text--on-message bt
-            (list :version '("server-v1")
-                  :parents nil
-                  :patches nil
-                  :body "hello"
-                  :headers nil))
-          ;; Buffer matches server — no PUT needed
-          (should (equal (braid-text--buffer-text bt) "hello"))
-          (should (= (braid-text-pending-puts bt) 0)))
+          (with-current-buffer buf (insert "old"))
+          (braid-text--flush bt)
+          ;; Mute should have been cleared (time expired)
+          (should (null (braid-text-muted-until bt))))
       (kill-buffer buf))))
 
 

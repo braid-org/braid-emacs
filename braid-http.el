@@ -201,6 +201,7 @@ Returns (new-raw . new-body).  Partial chunks stay in new-raw."
   (reconnect-max-delay 30.0) ; upper bound for reconnect-delay
   (extra-headers    nil)   ; alist: extra GET headers (preserved across reconnects)
   (last-parents     nil)   ; list of strings: sent as Parents on reconnect
+  (parents-fn       nil)   ; function returning parents list; overrides last-parents on reconnect
   ;; Heartbeat-based dead-connection detection
   (heartbeat-interval nil)   ; requested interval in seconds, or nil to disable
   (heartbeat-timer    nil)   ; recurring check timer
@@ -503,7 +504,9 @@ the SENTINEL will be called with an \"open\" event when ready."
            delay nil
            (lambda ()
              (when (not (eq (braid-http-sub-status sub) :closed))
-               (braid-http--open sub (braid-http-sub-last-parents sub))))))))
+               (braid-http--open sub (if (braid-http-sub-parents-fn sub)
+                                         (funcall (braid-http-sub-parents-fn sub))
+                                       (braid-http-sub-last-parents sub)))))))))
 
 (defun braid-http-expedite-reconnect (sub)
   "If SUB is disconnected, cancel its pending timer and reconnect immediately.
@@ -513,7 +516,9 @@ Resets the backoff delay to 1.0.  No-op if SUB is not disconnected."
       (cancel-timer (braid-http-sub-reconnect-timer sub))
       (setf (braid-http-sub-reconnect-timer sub) nil))
     (setf (braid-http-sub-reconnect-delay sub) 1.0)
-    (braid-http--open sub (braid-http-sub-last-parents sub))))
+    (braid-http--open sub (if (braid-http-sub-parents-fn sub)
+                             (funcall (braid-http-sub-parents-fn sub))
+                           (braid-http-sub-last-parents sub)))))
 
 
 ;;;; ======================================================================
@@ -522,7 +527,7 @@ Resets the backoff delay to 1.0.  No-op if SUB is not disconnected."
 
 (cl-defun braid-http-subscribe (host port path on-message
                           &key on-connect on-disconnect peer extra-headers tls
-                          heartbeat-interval)
+                          heartbeat-interval parents-fn)
   "Open a Braid-HTTP GET subscription to HOST:PORT/PATH.
 
 ON-MESSAGE is called for each sub-response in the 209 stream with a plist:
@@ -541,6 +546,8 @@ EXTRA-HEADERS is an alist of additional GET headers sent on every connect.
 HEARTBEAT-INTERVAL, when non-nil, requests heartbeats from the server
   every N seconds and kills the connection if no data arrives within
   1.2*N+3 seconds.
+PARENTS-FN, when non-nil, is a function called on each reconnect to get
+  the parents list.  Overrides the default `last-parents' tracking.
 
 Returns a braid-http-sub struct.  Pass to braid-http-unsubscribe to close."
   (let ((sub (make-braid-http-sub
@@ -555,7 +562,8 @@ Returns a braid-http-sub struct.  Pass to braid-http-unsubscribe to close."
               :on-connect         on-connect
               :on-disconnect      on-disconnect
               :extra-headers      extra-headers
-              :heartbeat-interval heartbeat-interval)))
+              :heartbeat-interval heartbeat-interval
+              :parents-fn         parents-fn)))
     (braid-http--open sub nil)
     sub))
 
