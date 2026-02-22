@@ -135,8 +135,10 @@ The PUT is sent immediately on the persistent put-proc connection (pipelined)."
           (cl-incf (braid-text-pending-puts bt))
           (if (and proc (process-live-p proc))
               (process-send-string proc request)
+            ;; put-proc is dead — queue the request and reconnect if needed
             (setf (braid-text-put-queue bt)
-                  (concat (braid-text-put-queue bt) request)))))))))
+                  (concat (braid-text-put-queue bt) request))
+            (when proc (braid-text--put-proc-reconnect bt)))))))))
 
 (defun braid-text-close (bt)
   "Close BT's PUT connection and subscription, stopping all syncing."
@@ -256,10 +258,9 @@ socket that we write PUT request bytes onto directly."
 
 (defun braid-text--put-proc-reconnect (bt)
   "Reconnect BT's put-proc after a disconnect.
-Clears the put-queue because queued requests had their versions optimistically
-advanced; stale requests with old parents would be rejected by the server."
-  (setf (braid-text-put-queue bt) "")
-  (setf (braid-text-put-proc  bt) (braid-text--put-proc-open bt)))
+Queued PUTs are preserved because their version chains are still valid
+\(current-version is no longer reset on reconnect)."
+  (setf (braid-text-put-proc bt) (braid-text--put-proc-open bt)))
 
 (defun braid-text--connection-dead (bt)
   "Handle a detected dead connection for BT.
@@ -314,8 +315,10 @@ from that version, or wait for a retry PUT to establish the version."
               (when-let ((ct (cdr (assoc "content-type" headers))))
                 (setf (braid-text-content-type bt) ct))
               ;; Verify integrity if the server sent a repr-digest.
+              ;; Compare against prev_state (what the server thinks we have),
+              ;; not buffer text (which may include unsent local edits).
               (when-let ((expected (cdr (assoc "repr-digest" headers))))
-                (let ((actual (braid-text--repr-digest (braid-text--buffer-text bt))))
+                (let ((actual (braid-text--repr-digest (braid-text-prev-state bt))))
                   (unless (equal actual expected)
                     (message "Braid: DIGEST MISMATCH after version %s — reconnecting"
                              version)
@@ -452,8 +455,19 @@ for shifts from preceding patches."
            (set-buffer-modified-p nil)
            (when buffer-file-name (set-visited-file-modtime)))
          result)))
-    (setf (braid-text-prev-state bt)
-          (braid-text--buffer-text bt))))
+    ;; Update prev_state by applying the same patches to the old prev_state
+    ;; (not the buffer text).  This way local edits in the buffer are NOT
+    ;; absorbed into prev_state — they'll be picked up by the next flush.
+    (let ((ps (braid-text-prev-state bt))
+          (offset 0))
+      (dolist (p patches)
+        (let* ((cr      (plist-get p :content-range))
+               (start   (+ (nth 1 cr) offset))
+               (end     (+ (nth 2 cr) offset))
+               (content (plist-get p :body)))
+          (setq ps (concat (substring ps 0 start) content (substring ps end)))
+          (cl-incf offset (- (length content) (- end start)))))
+      (setf (braid-text-prev-state bt) ps))))
 
 
 ;;;; ======================================================================

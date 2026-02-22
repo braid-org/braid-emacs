@@ -755,5 +755,234 @@ Prints PASS/FAIL for each step and exits with code 0 or 1."
     (kill-emacs (if fail 1 0)))))
 
 
+(defun braid-test-reconnect ()
+  "Test reconnection against a live braid-text server on 127.0.0.1:8888.
+Tests that:
+  1. Two clients sync edits via /text/* (simpleton CRDT).
+  2. Killing client A's connection triggers auto-reconnect.
+  3. Edits made by client B while A was disconnected arrive after reconnect.
+  4. Client A's buffer is NOT reverted — both clients converge.
+Prints PASS/FAIL for each step and exits with code 0 or 1."
+  (let* ((path (format "/text/reconnect-test-%x" (random #xffffff)))
+         (fail nil)
+         (connected-a nil) (disconnected-a nil)
+         (connected-b nil)
+         ;; Client A
+         (buf-a (generate-new-buffer " *braid-test-A*"))
+         (bt-a (braid-text-open "127.0.0.1" 8888 path buf-a
+                   :heartbeat-interval nil
+                   :on-connect    (lambda () (setq connected-a t))
+                   :on-disconnect (lambda () (setq disconnected-a t))))
+         ;; Client B
+         (buf-b (generate-new-buffer " *braid-test-B*"))
+         (bt-b (braid-text-open "127.0.0.1" 8888 path buf-b
+                   :heartbeat-interval nil
+                   :on-connect    (lambda () (setq connected-b t))
+                   :on-disconnect (lambda () nil))))
+
+    (cl-flet ((wait (pred secs label)
+                (unless (braid-test--wait-for pred secs label)
+                  (setq fail t)))
+              (text-a () (with-current-buffer buf-a
+                           (buffer-substring-no-properties (point-min) (point-max))))
+              (text-b () (with-current-buffer buf-b
+                           (buffer-substring-no-properties (point-min) (point-max)))))
+
+      ;; 1. Wait for both clients to connect
+      (wait (lambda () (and connected-a connected-b)) 5.0
+            "both clients connected")
+
+      ;; 2. Client A types "hello"
+      (unless fail
+        (with-current-buffer buf-a
+          (let ((inhibit-modification-hooks t)) (insert "hello")))
+        (braid-text--flush bt-a)
+        (wait (lambda () (= (braid-text-pending-puts bt-a) 0)) 5.0
+              "A: PUT acked")
+        (unless fail
+          (wait (lambda () (equal (text-b) "hello")) 5.0
+                "B: received A's edit 'hello'")))
+
+      ;; 3. Client B types " world"
+      (unless fail
+        (with-current-buffer buf-b
+          (let ((inhibit-modification-hooks t))
+            (goto-char (point-max)) (insert " world")))
+        (braid-text--flush bt-b)
+        (wait (lambda () (= (braid-text-pending-puts bt-b) 0)) 5.0
+              "B: PUT acked")
+        (unless fail
+          (wait (lambda () (equal (text-a) "hello world")) 5.0
+                "A: received B's edit → 'hello world'")))
+
+      ;; 4. Kill A's subscription (simulate network drop)
+      (unless fail
+        (setq disconnected-a nil)
+        (setq connected-a nil)
+        (let ((proc (braid-http-sub-process (braid-text-sub bt-a))))
+          (when (and proc (process-live-p proc))
+            (delete-process proc)))
+        (wait (lambda () disconnected-a) 3.0
+              "A: disconnect detected"))
+
+      ;; 5. While A is disconnected, B types " and goodbye"
+      (unless fail
+        (with-current-buffer buf-b
+          (let ((inhibit-modification-hooks t))
+            (goto-char (point-max)) (insert " and goodbye")))
+        (braid-text--flush bt-b)
+        (wait (lambda () (= (braid-text-pending-puts bt-b) 0)) 5.0
+              "B: PUT acked while A is disconnected")
+        (unless fail
+          (message "  B buffer: %S" (text-b))))
+
+      ;; 6. Wait for A to auto-reconnect
+      (unless fail
+        (wait (lambda ()
+                (eq (braid-http-sub-status (braid-text-sub bt-a)) :connected))
+              10.0 "A: auto-reconnected"))
+
+      ;; 7. Verify A got B's edit (not reverted)
+      (unless fail
+        (wait (lambda () (string-match-p "goodbye" (text-a))) 5.0
+              "A: received B's edit after reconnect")
+        (unless fail
+          (let ((a (text-a)) (b (text-b)))
+            (if (equal a b)
+                (message "PASS: buffers converged: %S" a)
+              (message "FAIL: buffers diverged — A=%S  B=%S" a b)
+              (setq fail t))))))
+
+    ;; Cleanup
+    (braid-text-close bt-a)
+    (braid-text-close bt-b)
+    (when (buffer-live-p buf-a) (kill-buffer buf-a))
+    (when (buffer-live-p buf-b) (kill-buffer buf-b))
+    (kill-emacs (if fail 1 0))))
+
+
+(defun braid-test-reconnect-local-edits ()
+  "Test that local edits made while disconnected survive reconnection.
+The original bug: remote edits were being reverted because the client
+treated stale buffer contents as local edits.  This test verifies:
+  1. Client A and B sync normally.
+  2. A disconnects.
+  3. BOTH A and B make edits while disconnected.
+  4. A reconnects.
+  5. A's local edits survive, B's remote edits arrive, buffers converge."
+  (let* ((path (format "/text/reconnect-local-%x" (random #xffffff)))
+         (fail nil)
+         (connected-a nil) (disconnected-a nil)
+         (connected-b nil)
+         ;; Client A
+         (buf-a (generate-new-buffer " *braid-test-A*"))
+         (bt-a (braid-text-open "127.0.0.1" 8888 path buf-a
+                   :heartbeat-interval nil
+                   :on-connect    (lambda () (setq connected-a t))
+                   :on-disconnect (lambda () (setq disconnected-a t))))
+         ;; Client B
+         (buf-b (generate-new-buffer " *braid-test-B*"))
+         (bt-b (braid-text-open "127.0.0.1" 8888 path buf-b
+                   :heartbeat-interval nil
+                   :on-connect    (lambda () (setq connected-b t))
+                   :on-disconnect (lambda () nil))))
+
+    (cl-flet ((wait (pred secs label)
+                (unless (braid-test--wait-for pred secs label)
+                  (setq fail t)))
+              (text-a () (with-current-buffer buf-a
+                           (buffer-substring-no-properties (point-min) (point-max))))
+              (text-b () (with-current-buffer buf-b
+                           (buffer-substring-no-properties (point-min) (point-max)))))
+
+      ;; 1. Wait for both clients to connect
+      (wait (lambda () (and connected-a connected-b)) 5.0
+            "both clients connected")
+
+      ;; 2. Client A types "aaa bbb"
+      (unless fail
+        (with-current-buffer buf-a
+          (let ((inhibit-modification-hooks t)) (insert "aaa bbb")))
+        (braid-text--flush bt-a)
+        (wait (lambda () (= (braid-text-pending-puts bt-a) 0)) 5.0
+              "A: PUT acked")
+        (unless fail
+          (wait (lambda () (equal (text-b) "aaa bbb")) 5.0
+                "B: received A's edit 'aaa bbb'")))
+
+      ;; 3. Kill A's subscription (simulate network drop)
+      (unless fail
+        (setq disconnected-a nil)
+        (setq connected-a nil)
+        (let ((proc (braid-http-sub-process (braid-text-sub bt-a))))
+          (when (and proc (process-live-p proc))
+            (delete-process proc)))
+        ;; Also kill put-proc so local edits can't be sent
+        (when-let ((p (braid-text-put-proc bt-a)))
+          (when (process-live-p p) (delete-process p)))
+        (wait (lambda () disconnected-a) 3.0
+              "A: disconnect detected"))
+
+      ;; 4. A makes local edits (appends " ccc") while disconnected
+      (unless fail
+        (with-current-buffer buf-a
+          (let ((inhibit-modification-hooks t))
+            (goto-char (point-max)) (insert " ccc")))
+        (message "  A buffer (disconnected, local edit): %S" (text-a)))
+
+      ;; 5. B makes edits (prepends "zzz ") while A is disconnected
+      (unless fail
+        (with-current-buffer buf-b
+          (let ((inhibit-modification-hooks t))
+            (goto-char (point-min)) (insert "zzz ")))
+        (braid-text--flush bt-b)
+        (wait (lambda () (= (braid-text-pending-puts bt-b) 0)) 5.0
+              "B: PUT acked while A is disconnected")
+        (unless fail
+          (message "  B buffer: %S" (text-b))))
+
+      ;; 6. Wait for A to auto-reconnect
+      (unless fail
+        (wait (lambda ()
+                (eq (braid-http-sub-status (braid-text-sub bt-a)) :connected))
+              10.0 "A: auto-reconnected"))
+
+      ;; 7. Verify A got B's remote edit
+      (unless fail
+        (wait (lambda () (string-match-p "zzz" (text-a))) 5.0
+              "A: received B's remote edit after reconnect"))
+
+      ;; 8. Verify A kept local edit
+      (unless fail
+        (if (string-match-p "ccc" (text-a))
+            (message "PASS: A kept local edit 'ccc'")
+          (message "FAIL: A lost local edit 'ccc' — buffer: %S" (text-a))
+          (setq fail t)))
+
+      ;; 9. Flush A's local edits to the server
+      (unless fail
+        (braid-text--flush bt-a)
+        (wait (lambda () (= (braid-text-pending-puts bt-a) 0)) 5.0
+              "A: local edits PUT acked"))
+
+      ;; 10. Wait for B to receive A's local edit, then check convergence
+      (unless fail
+        (wait (lambda () (string-match-p "ccc" (text-b))) 5.0
+              "B: received A's local edit")
+        (unless fail
+          (let ((a (text-a)) (b (text-b)))
+            (if (equal a b)
+                (message "PASS: buffers converged: %S" a)
+              (message "FAIL: buffers diverged — A=%S  B=%S" a b)
+              (setq fail t))))))
+
+    ;; Cleanup
+    (braid-text-close bt-a)
+    (braid-text-close bt-b)
+    (when (buffer-live-p buf-a) (kill-buffer buf-a))
+    (when (buffer-live-p buf-b) (kill-buffer buf-b))
+    (kill-emacs (if fail 1 0))))
+
+
 (provide 'braid-http-tests)
 ;;; braid-http-tests.el ends here
