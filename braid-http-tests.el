@@ -478,8 +478,8 @@ into the sub-headers parser, simulating what arrives after dechunking."
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
-               :prev-state ""
-               :current-version '("v0"))))
+               :client-state ""
+               :client-version '("v0"))))
     (unwind-protect
         (progn
           (with-current-buffer buf (insert "hello"))
@@ -497,8 +497,8 @@ into the sub-headers parser, simulating what arrives after dechunking."
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
-               :prev-state ""
-               :current-version '("v0"))))
+               :client-state ""
+               :client-version '("v0"))))
     (unwind-protect
         (progn
           (with-current-buffer buf (insert "hello"))
@@ -565,8 +565,10 @@ into the sub-headers parser, simulating what arrives after dechunking."
 ;;;; Reconnect behavior
 ;;;; ======================================================================
 
-(ert-deftest braid-reconnect/preserves-current-version ()
-  "braid-text--reconnect does NOT reset current-version."
+(ert-deftest braid-reconnect/preserves-client-version ()
+  "braid-text--reconnect does NOT reset client-version.
+Offline edits are flushed on-connect (after the subscription establishes),
+not during reconnect itself."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (sub (make-braid-http-sub
                :host "127.0.0.1" :port 8888 :path "/test"
@@ -574,8 +576,8 @@ into the sub-headers parser, simulating what arrives after dechunking."
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
-               :current-version '("v0")
-               :prev-state "hello"
+               :client-version '("v0")
+               :client-state "hello"
                :sub sub)))
     (unwind-protect
         (progn
@@ -585,14 +587,16 @@ into the sub-headers parser, simulating what arrives after dechunking."
                     ((symbol-function 'braid-text--put-proc-open)
                      (lambda (_bt) nil)))
             (braid-text--reconnect bt))
-          ;; Version is preserved (not reset to nil)
-          (should (equal (braid-text-current-version bt) '("v0")))
+          ;; Version is preserved (not reset to nil) — flush happens
+          ;; later in on-connect when the subscription establishes.
+          (should (equal (braid-text-client-version bt) '("v0")))
           ;; pending-puts reset to 0
           (should (= (braid-text-pending-puts bt) 0)))
       (kill-buffer buf))))
 
 (ert-deftest braid-reconnect/resets-pending-puts ()
-  "braid-text--reconnect resets pending-puts and cancels ACK timer."
+  "braid-text--reconnect resets pending-puts and cancels ACK timer.
+When no offline edits exist, pending-puts stays at 0 after reset."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (sub (make-braid-http-sub
                :host "127.0.0.1" :port 8888 :path "/test"
@@ -602,8 +606,8 @@ into the sub-headers parser, simulating what arrives after dechunking."
                :peer "test" :buffer buf
                :pending-puts 5
                :put-ack-timer (run-with-timer 999 nil #'ignore)
-               :current-version '("v0")
-               :prev-state "hello"
+               :client-version '("v0")
+               :client-state ""
                :sub sub)))
     (unwind-protect
         (cl-letf (((symbol-function 'braid-http-subscribe)
@@ -611,6 +615,8 @@ into the sub-headers parser, simulating what arrives after dechunking."
                   ((symbol-function 'braid-text--put-proc-open)
                    (lambda (_bt) nil)))
           (braid-text--reconnect bt)
+          ;; No offline edits (buffer = client-state = ""), so pending-puts
+          ;; was reset to 0 and the flush was a no-op.
           (should (= (braid-text-pending-puts bt) 0))
           (should (null (braid-text-put-ack-timer bt))))
       (when (braid-text-put-ack-timer bt)
@@ -627,8 +633,8 @@ into the sub-headers parser, simulating what arrives after dechunking."
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
-               :prev-state "old"
-               :current-version '("v0")
+               :client-state "old"
+               :client-version '("v0")
                :pending-puts 10
                :max-outstanding-puts 10)))
     (unwind-protect
@@ -645,8 +651,8 @@ into the sub-headers parser, simulating what arrives after dechunking."
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
-               :prev-state "old"
-               :current-version '("v0")
+               :client-state "old"
+               :client-version '("v0")
                :muted-until (+ (float-time) 60.0))))
     (unwind-protect
         (progn
@@ -662,8 +668,8 @@ into the sub-headers parser, simulating what arrives after dechunking."
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
-               :prev-state "old"
-               :current-version '("v0")
+               :client-state "old"
+               :client-version '("v0")
                :muted-until (- (float-time) 1.0))))
     (unwind-protect
         (progn

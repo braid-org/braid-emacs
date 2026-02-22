@@ -9,6 +9,7 @@
 ;;; Commentary:
 
 ;; Implements the simpleton sync algorithm on top of braid-http.el.
+;; See https://braid.org/protocol/simpleton for the protocol spec.
 ;; Connects an Emacs buffer to a braid-text server resource and handles
 ;; diffing, patching, version tracking, and digest verification.
 
@@ -32,8 +33,9 @@
   "State for one simpleton-synced buffer."
   host port path peer buffer
   (tls             nil)    ; t to use TLS
-  (current-version nil)    ; sorted list of version strings (what we last saw/sent)
-  (prev-state      "")     ; buffer text as of current-version
+  (client-version nil)    ; sorted list of version strings
+  (client-state   "")     ; text content as of client-version
+                          ;   may differ from buffer text if local edits are pending
   (char-counter    -1)     ; cumulative char-delta; used to form version IDs
   (put-proc        nil)    ; persistent network process for pipelining PUTs
   (put-queue       "")     ; raw PUT request bytes queued while put-proc is connecting
@@ -73,10 +75,16 @@ Set to nil to disable heartbeat-based dead connection detection."
                            (lambda (msg) (braid-text--on-message bt msg))
                            :peer          peer
                            :tls           tls
-                           :on-connect    on-connect
+                           :on-connect    (lambda ()
+                                          ;; Flush offline edits before server data arrives.
+                                          ;; This advances client-version so the server's
+                                          ;; patches (parented at our old version) are rejected
+                                          ;; by the parent check.  The server will then rebase.
+                                          (braid-text--flush bt)
+                                          (when on-connect (funcall on-connect)))
                            :on-disconnect on-disconnect
                            :heartbeat-interval heartbeat-interval
-                           :parents-fn    (lambda () (braid-text-current-version bt))
+                           :parents-fn    (lambda () (braid-text-client-version bt))
                            :extra-headers '(("Merge-Type" . "simpleton")
                                              ("Accept"     . "text/plain, text/markdown, text/html, application/json"))))
     (setf (braid-text-put-proc bt) (braid-text--put-proc-open bt))
@@ -99,14 +107,14 @@ The PUT is sent immediately on the persistent put-proc connection (pipelined)."
     (when (braid-text-muted-until bt)
       (setf (braid-text-muted-until bt) nil))
     (let* ((new-state (braid-text--buffer-text bt))
-           (prev      (braid-text-prev-state bt)))
+           (prev      (braid-text-client-state bt)))
     (unless (equal new-state prev)
       (let* ((diff          (braid-text--simple-diff prev new-state))
              (start         (plist-get diff :start))
              (end           (plist-get diff :end))
              (content       (plist-get diff :content))
              (delta         (+ (- end start) (length content)))
-             (parents       (braid-text-current-version bt)))
+             (parents       (braid-text-client-version bt)))
         (cl-incf (braid-text-char-counter bt) delta)
         (let* ((version       (list (format "%s-%d"
                                             (braid-text-peer bt)
@@ -121,8 +129,8 @@ The PUT is sent immediately on the persistent put-proc connection (pipelined)."
                                 (braid-text-host bt) (braid-text-port bt) (braid-text-path bt)
                                 version parents body-headers content-bytes))
                (proc          (braid-text-put-proc bt)))
-          (setf (braid-text-current-version bt) version)
-          (setf (braid-text-prev-state bt) new-state)
+          (setf (braid-text-client-version bt) version)
+          (setf (braid-text-client-state bt) new-state)
           ;; Start PUT ACK timer when transitioning 0 → >0
           (when (and (= (braid-text-pending-puts bt) 0)
                      (not (braid-text-put-ack-timer bt)))
@@ -154,10 +162,10 @@ The PUT is sent immediately on the persistent put-proc connection (pipelined)."
 (defun braid-text--reconnect (bt)
   "Reconnect BT's subscription without resetting state.
 Closes the old subscription and opens a fresh one with Parents set to
-`current-version' (via parents-fn).  Local buffer edits are preserved
+`client-version' (via parents-fn).  Local buffer edits are preserved
 because the server will send patches from our version, not a full snapshot."
   (message "Braid: reconnecting")
-  ;; Reset pending-puts — lost PUTs will never be acked
+  ;; Reset pending-puts counter for throttling — retried PUTs will re-increment it
   (setf (braid-text-pending-puts bt) 0)
   (when (braid-text-put-ack-timer bt)
     (cancel-timer (braid-text-put-ack-timer bt))
@@ -174,7 +182,7 @@ because the server will send patches from our version, not a full snapshot."
     (when-let ((p (braid-text-put-proc bt)))
       (when (process-live-p p) (delete-process p)))
     (braid-text--put-proc-reconnect bt)
-    ;; Open a new subscription with parents-fn returning current-version
+    ;; Open a new subscription — on-connect will flush offline edits
     (let ((new-sub (braid-http-subscribe (braid-text-host bt)
                                     (braid-text-port bt)
                                     (braid-text-path bt)
@@ -184,7 +192,7 @@ because the server will send patches from our version, not a full snapshot."
                                     :on-connect    on-connect
                                     :on-disconnect on-disconnect
                                     :heartbeat-interval hb-interval
-                                    :parents-fn    (lambda () (braid-text-current-version bt))
+                                    :parents-fn    (lambda () (braid-text-client-version bt))
                                     :extra-headers '(("Merge-Type" . "simpleton")
                                                       ("Accept"     . "text/plain, text/markdown, text/html, application/json")))))
       (setf (braid-http-sub-reconnect-max-delay new-sub) max-delay)
@@ -258,14 +266,14 @@ socket that we write PUT request bytes onto directly."
 
 (defun braid-text--put-proc-reconnect (bt)
   "Reconnect BT's put-proc after a disconnect.
-Queued PUTs are preserved because their version chains are still valid
-\(current-version is no longer reset on reconnect)."
+Queued PUTs are preserved — their version chains are valid because
+client-version is never reset on reconnect."
   (setf (braid-text-put-proc bt) (braid-text--put-proc-open bt)))
 
 (defun braid-text--connection-dead (bt)
   "Handle a detected dead connection for BT.
 Reconnects the subscription (which will use parents-fn to send
-current-version as Parents).  The server will either send patches
+client-version as Parents).  The server will either send patches
 from that version, or wait for a retry PUT to establish the version."
   (message "Braid: connection dead (PUT ACK timeout) — reconnecting")
   (braid-text--reconnect bt))
@@ -293,12 +301,12 @@ from that version, or wait for a retry PUT to establish the version."
            (headers (plist-get msg :headers)))
       (when braid-text-debug
         (message "Braid: recv version=%s parents=%s cur=%s match=%s patches=%d body=%s"
-                 version parents (braid-text-current-version bt)
-                 (equal parents (braid-text-current-version bt))
+                 version parents (braid-text-client-version bt)
+                 (equal parents (braid-text-client-version bt))
                  (length (or patches '()))
                  (if body (format "%dchars" (length body)) "nil")))
-      ;; Simpleton: only accept if parents == our current-version
-      (when (equal parents (braid-text-current-version bt))
+      ;; Simpleton: only accept if parents == our client-version
+      (when (equal parents (braid-text-client-version bt))
         (condition-case err
             (progn
               ;; Apply patches incrementally or set full body (initial connect)
@@ -309,16 +317,15 @@ from that version, or wait for a retry PUT to establish the version."
                 (braid-text--set-buffer-text bt (or body ""))))
               ;; Advance version only after the apply succeeds, so a crash here
               ;; does not silently advance the version and cause divergence.
-              (setf (braid-text-current-version bt)
+              (setf (braid-text-client-version bt)
                     (sort (copy-sequence version) #'string<))
               ;; Capture content-type from server for use in PUTs.
               (when-let ((ct (cdr (assoc "content-type" headers))))
                 (setf (braid-text-content-type bt) ct))
               ;; Verify integrity if the server sent a repr-digest.
-              ;; Compare against prev_state (what the server thinks we have),
-              ;; not buffer text (which may include unsent local edits).
+              ;; Compare against client-state (= buffer after applying patches).
               (when-let ((expected (cdr (assoc "repr-digest" headers))))
-                (let ((actual (braid-text--repr-digest (braid-text-prev-state bt))))
+                (let ((actual (braid-text--repr-digest (braid-text-client-state bt))))
                   (unless (equal actual expected)
                     (message "Braid: DIGEST MISMATCH after version %s — reconnecting"
                              version)
@@ -384,7 +391,7 @@ by THUNK via `braid-text--adjust-point') are written back."
            (mapcar (lambda (ws)
                      (cons (car ws) (min (cdr ws) new-len)))
                    saved)))))
-    (setf (braid-text-prev-state bt) text)))
+    (setf (braid-text-client-state bt) text)))
 
 (defun braid-text--adjust-point-absolute (pos patches)
   "Adjust 0-indexed char offset POS for absolute-coordinate PATCHES.
@@ -455,19 +462,8 @@ for shifts from preceding patches."
            (set-buffer-modified-p nil)
            (when buffer-file-name (set-visited-file-modtime)))
          result)))
-    ;; Update prev_state by applying the same patches to the old prev_state
-    ;; (not the buffer text).  This way local edits in the buffer are NOT
-    ;; absorbed into prev_state — they'll be picked up by the next flush.
-    (let ((ps (braid-text-prev-state bt))
-          (offset 0))
-      (dolist (p patches)
-        (let* ((cr      (plist-get p :content-range))
-               (start   (+ (nth 1 cr) offset))
-               (end     (+ (nth 2 cr) offset))
-               (content (plist-get p :body)))
-          (setq ps (concat (substring ps 0 start) content (substring ps end)))
-          (cl-incf offset (- (length content) (- end start)))))
-      (setf (braid-text-prev-state bt) ps))))
+    (setf (braid-text-client-state bt)
+          (braid-text--buffer-text bt))))
 
 
 ;;;; ======================================================================
