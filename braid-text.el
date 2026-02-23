@@ -63,7 +63,7 @@ ON-CONNECT and ON-DISCONNECT are optional callbacks forwarded to
 `braid-http-subscribe'.
 HEARTBEAT-INTERVAL (default 30) requests server heartbeats every N seconds.
 Set to nil to disable heartbeat-based dead connection detection."
-  (let* ((peer (format "%04x%04x" (random #xffff) (random #xffff)))
+  (let* ((peer (format "emacs%04x%04x" (random #xffff) (random #xffff)))
          (bt   (make-braid-text :host   host
                                 :port   port
                                 :path   path
@@ -329,7 +329,9 @@ from that version, or wait for a retry PUT to establish the version."
                   (unless (equal actual expected)
                     (message "Braid: DIGEST MISMATCH after version %s — reconnecting"
                              version)
-                    (run-with-timer 0.1 nil #'braid-text--reconnect bt))))
+                    (braid-live)
+                    ;; (run-with-timer 0.1 nil #'braid-text--reconnect bt)
+                    )))
               ;; After receiving an ACK-like update, flush any accumulated edits
               ;; (important when throttling has been holding back sends).
               (braid-text--flush bt))

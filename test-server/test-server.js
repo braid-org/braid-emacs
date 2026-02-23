@@ -11,6 +11,7 @@
 
 var braid_http = require('braid-http')
 var braid_text = require('braid-text')
+var path_mod = require('path')
 
 // subscribers for the echo server: Map<path, Set<res>>
 var subscribers = new Map()
@@ -20,14 +21,61 @@ function get_subscribers(path) {
     return subscribers.get(path)
 }
 
-require('http').createServer(
+var server = require('http').createServer()
+server.on('request', (req, res) => {
+    console.log('RAW:', req.method, req.url,
+                JSON.stringify({
+                    muxVer: req.headers['multiplex-version'],
+                    muxThru: req.headers['multiplex-through'],
+                    accept: req.headers['accept'],
+                    ct: req.headers['content-type'],
+                    sub: req.headers['subscribe']
+                }))
+})
+server.on('request',
     braid_http.http_server(async (req, res) => {
         var path = req.url
-        console.log(req.method, path)
+        console.log('HANDLER:', req.method, path, 'is_mux:', res.is_multiplexer || false)
+
+        // ── static files ─────────────────────────────────────────────────────
+        if (path === '/cursor-client.html') {
+            var file = path_mod.join(__dirname, '..', 'cursor-client.html')
+            res.setHeader('Content-Type', 'text/html')
+            require('fs').createReadStream(file).pipe(res)
+            return
+        }
+        if (path === '/braid-http-client.js') {
+            var file = path_mod.join(__dirname, 'node_modules', 'braid-http', 'braid-http-client.js')
+            res.setHeader('Content-Type', 'application/javascript')
+            require('fs').createReadStream(file).pipe(res)
+            return
+        }
+        if (path === '/simpleton-sync.js') {
+            var file = path_mod.join(__dirname, 'node_modules', 'braid-text', 'client', 'simpleton-sync.js')
+            res.setHeader('Content-Type', 'application/javascript')
+            require('fs').createReadStream(file).pipe(res)
+            return
+        }
+        if (path === '/cursor-highlights.js') {
+            var file = path_mod.join(__dirname, 'node_modules', 'braid-text', 'client', 'cursor-highlights.js')
+            res.setHeader('Content-Type', 'application/javascript')
+            require('fs').createReadStream(file).pipe(res)
+            return
+        }
+        if (path === '/cursor-sync.js') {
+            var file = path_mod.join(__dirname, 'node_modules', 'braid-text', 'client', 'cursor-sync.js')
+            res.setHeader('Content-Type', 'application/javascript')
+            require('fs').createReadStream(file).pipe(res)
+            return
+        }
 
         // ── braid-text routes ──────────────────────────────────────────────
         if (path.startsWith('/text/')) {
             try {
+                // Strip multiplexing headers so braid-text's internal braidify
+                // doesn't try to handle multiplexing a second time.
+                delete req.headers['multiplex-through']
+                delete req.headers['multiplex-version']
                 await braid_text.serve(req, res)
             } catch (e) {
                 console.error('braid-text error:', e.message)
@@ -69,7 +117,8 @@ require('http').createServer(
             res.end()
         }
     })
-).listen(8888, '127.0.0.1', () => {
+)
+server.listen(8888, '127.0.0.1', () => {
     console.log('Braid test server listening on http://127.0.0.1:8888')
     console.log('  /*       → echo server (for braid-http.el integration tests)')
     console.log('  /text/*  → braid-text server (simpleton CRDT)')

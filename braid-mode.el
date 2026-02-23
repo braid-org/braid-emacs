@@ -17,6 +17,7 @@
 ;;; Code:
 
 (require 'braid-text)
+(require 'braid-cursors)
 
 
 ;;;; ======================================================================
@@ -54,6 +55,9 @@
 
 (defvar-local braid-mode--bt nil
   "The `braid-text' struct syncing this buffer, or nil if not connected.")
+
+(defvar-local braid-mode--bc nil
+  "The `braid-cursor' struct for cursor sharing, or nil.")
 
 (defvar-local braid-mode--ever-connected nil
   "Non-nil once the subscription has received a successful 209 response.")
@@ -135,6 +139,10 @@ to the buffer.  This is expected and not a real conflict."
   "Push local buffer edits to the server."
   (when braid-mode--bt
     (braid-text-buffer-changed braid-mode--bt))
+  ;; Re-send local cursor position after any edit (local or remote)
+  ;; so remote peers see the updated position.
+  (when braid-mode--bc
+    (braid-cursors--force-send braid-mode--bc))
   ;; Always keep the buffer appearing unmodified — whether we sent a change
   ;; or not (handles cases like capitalize-word on already-capitalized text).
   (set-buffer-modified-p nil)
@@ -144,6 +152,9 @@ to the buffer.  This is expected and not a real conflict."
 
 (defun braid-mode--on-kill ()
   "Clean up braid connection when the buffer is killed."
+  (when braid-mode--bc
+    (braid-cursors-close braid-mode--bc)
+    (setq braid-mode--bc nil))
   (when braid-mode--bt
     (braid-text-close braid-mode--bt)
     (setq braid-mode--bt nil))
@@ -214,6 +225,9 @@ Enable with `braid-connect'; disable to close the connection."
     (setq create-lockfiles braid-mode--saved-create-lockfiles)
     (kill-local-variable 'create-lockfiles)
     (local-unset-key (kbd "C-x C-s"))
+    (when braid-mode--bc
+      (braid-cursors-close braid-mode--bc)
+      (setq braid-mode--bc nil))
     (when braid-mode--bt
       (braid-text-close braid-mode--bt)
       (setq braid-mode--bt nil)
@@ -275,13 +289,24 @@ already connected."
 
 (defun braid-mode--on-connect ()
   "Called when the subscription receives a successful 209 response."
-  (setq braid-mode--ever-connected t))
+  (setq braid-mode--ever-connected t)
+  ;; Retry cursor setup if it failed earlier (e.g. server was not running).
+  (when (and (not braid-mode--bc) braid-mode--bt)
+    (setq braid-mode--bc (braid-cursors-open braid-mode--bt))))
 
 (defun braid-mode--on-disconnect ()
-  "Called on unexpected disconnect.  Tries TLS fallback if never connected."
+  "Called on unexpected disconnect.  Tries TLS fallback if never connected.
+Only attempts TLS fallback if the TCP connection was actually established
+\(status progressed past :connecting), indicating a protocol mismatch
+rather than a server that is simply not running."
   (when (and (not braid-mode--ever-connected)
              (not braid-mode--tls-fallback-tried)
-             braid-mode--bt)
+             braid-mode--bt
+             ;; Only try TLS fallback if TCP connected but HTTP failed.
+             ;; If status is still :connecting, the server is just unreachable
+             ;; and the normal reconnect loop will handle it.
+             (not (eq (braid-http-sub-status (braid-text-sub braid-mode--bt))
+                      :connecting)))
     (setq braid-mode--tls-fallback-tried t)
     (let* ((bt      braid-mode--bt)
            (host    (braid-text-host bt))
@@ -304,6 +329,9 @@ already connected."
                       (lambda ()
                         (when (buffer-live-p buf)
                           (with-current-buffer buf
+                            (when braid-mode--bc
+                              (braid-cursors-close braid-mode--bc)
+                              (setq braid-mode--bc nil))
                             (braid-text-close bt)
                             (setq braid-mode--bt nil)
                             (setq braid-mode--ever-connected nil)
@@ -317,7 +345,8 @@ already connected."
                                                    :on-disconnect
                                                    (lambda ()
                                                      (with-current-buffer buf
-                                                       (braid-mode--on-disconnect))))))))))))
+                                                       (braid-mode--on-disconnect)))))
+                            (setq braid-mode--bc (braid-cursors-open braid-mode--bt)))))))))
 
 ;;;###autoload
 (defun braid-connect (host port path &optional tls)
@@ -332,6 +361,9 @@ is applied to the buffer once the subscription is established."
          (read-string "Path: " (concat "/text/" (buffer-name)))
          nil))
   ;; Close any existing connection first
+  (when braid-mode--bc
+    (braid-cursors-close braid-mode--bc)
+    (setq braid-mode--bc nil))
   (when braid-mode--bt
     (braid-text-close braid-mode--bt)
     (setq braid-mode--bt nil))
@@ -350,6 +382,8 @@ is applied to the buffer once the subscription is established."
                                           (lambda ()
                                             (with-current-buffer buf
                                               (braid-mode--on-disconnect)))))
+    ;; Start cursor sharing
+    (setq braid-mode--bc (braid-cursors-open braid-mode--bt))
     ;; Set initial reconnect cap based on whether this buffer is focused.
     (let* ((focused (eq buf (window-buffer (selected-window))))
            (max-d   (if focused

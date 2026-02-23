@@ -74,15 +74,24 @@ Returns nil for nil or empty input."
 ;;;; ======================================================================
 
 (defun braid-http--parse-content-range (str)
-  "Parse a Content-Range header value into (unit start end).
-Example: \"text [7:12]\" → (\"text\" 7 12).
+  "Parse a Content-Range header value.
+For text ranges: \"text [7:12]\" → (\"text\" 7 12).
+For json ranges: \"json [\\\"key\\\"]\" → (\"json\" \"key\").
 Returns nil if STR is nil or doesn't match."
-  (when (and str (string-match
-                  "\\([A-Za-z][A-Za-z0-9]*\\)\\s-*\\[\\([0-9]+\\):\\([0-9]+\\)\\]"
-                  str))
-    (list (match-string 1 str)
-          (string-to-number (match-string 2 str))
-          (string-to-number (match-string 3 str)))))
+  (when str
+    (cond
+     ;; text [N:N]
+     ((string-match
+       "\\([A-Za-z][A-Za-z0-9]*\\)\\s-*\\[\\([0-9]+\\):\\([0-9]+\\)\\]"
+       str)
+      (list (match-string 1 str)
+            (string-to-number (match-string 2 str))
+            (string-to-number (match-string 3 str))))
+     ;; json ["key"]
+     ((string-match
+       "json\\s-*\\[\"\\([^\"]*\\)\"\\]"
+       str)
+      (list "json" (match-string 1 str))))))
 
 
 ;;;; ======================================================================
@@ -195,7 +204,7 @@ Returns (new-raw . new-body).  Partial chunks stay in new-raw."
   (cur-patches-list nil)  ; accumulated patches (reversed), each a plist
   (cur-patch-cr     nil)  ; content-range of the patch currently being read
   ;; Reconnection
-  (status           :connecting)  ; :connecting | :connected | :disconnected | :closed
+  (status           :connecting)  ; :connecting | :open | :connected | :disconnected | :closed
   (reconnect-timer  nil)
   (reconnect-delay  1.0)   ; seconds; doubles on each failure
   (reconnect-max-delay 30.0) ; upper bound for reconnect-delay
@@ -483,13 +492,16 @@ the SENTINEL will be called with an \"open\" event when ready."
   "Process sentinel: handle connect/disconnect events."
   (cond
    ((string-prefix-p "open" event)
+    (setf (braid-http-sub-status sub) :open)
     (when request (process-send-string proc request)))
 
    ((not (eq (braid-http-sub-status sub) :closed))
-    ;; Unexpected disconnect — update status and maybe reconnect
-    (setf (braid-http-sub-status sub) :disconnected)
+    ;; Unexpected disconnect — call on-disconnect BEFORE updating status
+    ;; so the callback can inspect the previous status (e.g. :connecting
+    ;; means TCP never opened, :open means TCP opened but no 209).
     (when (braid-http-sub-on-disconnect sub)
       (funcall (braid-http-sub-on-disconnect sub)))
+    (setf (braid-http-sub-status sub) :disconnected)
     (braid-http--schedule-reconnect sub))))
 
 (defun braid-http--schedule-reconnect (sub)
