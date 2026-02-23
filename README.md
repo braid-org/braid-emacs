@@ -14,46 +14,25 @@ Add to your Emacs init:
 
 ## How it works
 
-Syncs Emacs with HTTP resources.  
-Uses the [simpleton](https://braid.org/simpleton) merge algorithm.  
+Syncs Emacs with HTTP resources.
+Uses the [simpleton](https://braid.org/simpleton) merge algorithm.
 Implements HTTP with a raw TLS over TCP connection and reads/writes Braid-HTTP in Emacs Lisp.
 
-### Live Editing
+### Opening a URL
 
-Now you can open files at web resources via your `~/http/` directory.  When you open a file like:
+Open any braid-text resource directly:
 
-```
-~/http/example.com/my-document
-~/http/localhost:8888/text/notes
-```
+    C-x C-f http://localhost:8888/text/notes RET
+    C-x C-f https://example.com/my-document RET
 
-braid-emacs automatically connects to the corresponding server and
-starts syncing.  The modeline shows `●` when connected.  Edits you make
-are pushed to the server immediately, and edits from other clients
-appear in real time.
+braid-emacs automatically connects and starts syncing. The modeline
+shows `●●` when connected and synced, `○○` when edits are pending,
+and `**` when disconnected.
 
-The path convention is:
+Edits you make are pushed to the server immediately, and edits from
+other clients appear in real time. The buffer is never saved to disk —
+`C-x C-s` is a no-op.
 
-```
-~/http/<host>/<path>          → https://<host>/<path>
-~/http/<host>:<port>/<path>   → https://<host>:<port>/<path>
-```
-
-You can toggle `live` mode with `M-x braid-live`:
-1. **In live mode:** your file is always "saved" to the network.  Each keystroke live updates the web resource, and vice versa.  It never actually never saves to disk.  It syncs directly with the internet.
-2. **Otherwise:** your file is edited normally, like to disk.  If you have braidfs running, then it will use the `Save == Sync` semantics.
-
-Files opened within `~/http/*` will be `live` by default when opened. You can configure this with  `braid-mode-auto-live` (enabled by default).
-
-### Manual connection
-
-You can also connect any buffer manually:
-
-```
-M-x braid-connect
-```
-
-This prompts for host, port, and path.
 
 ## Libraries
 
@@ -69,7 +48,7 @@ used independently of the live-editing mode:
   buffer to a braid-text resource and handles the full sync lifecycle:
   diffing, patching, version tracking, and digest verification.
 
-- **`braid-mode.el`** — minor mode and auto-connect for `~/http/` files.
+- **`braid-mode.el`** — minor mode, URL file handler, and auto-connect.
 
 - **`test-server/`** — Node.js braid-text server for development and
   testing.

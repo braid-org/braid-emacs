@@ -11,8 +11,7 @@
 ;; A minor mode that keeps an Emacs buffer in sync with a braid-text
 ;; server resource using the simpleton merge algorithm.
 ;;
-;; Use `braid-connect' to connect any buffer, or open files under
-;; `~/http/' for automatic braidfs integration via `braid-live'.
+;; Open URLs directly with find-file (C-x C-f http://host/path).
 
 ;;; Code:
 
@@ -27,16 +26,6 @@
 (defgroup braid nil
   "Braid-HTTP collaborative editing."
   :group 'communication)
-
-(defcustom braid-default-host "127.0.0.1"
-  "Default host for `braid-connect'."
-  :type 'string
-  :group 'braid)
-
-(defcustom braid-default-port 8888
-  "Default port for `braid-connect'."
-  :type 'integer
-  :group 'braid)
 
 (defcustom braid-reconnect-max-delay-foreground 3.0
   "Max reconnect backoff (seconds) for braid buffers displayed in the selected window."
@@ -148,7 +137,9 @@ to the buffer.  This is expected and not a real conflict."
   (set-buffer-modified-p nil)
   ;; Update modtime so Emacs doesn't warn about the file changing on disk
   ;; (e.g. when braidfs writes the synced content to the underlying file).
-  (when buffer-file-name (set-visited-file-modtime)))
+  (when (and buffer-file-name
+             (not (string-match-p "\\`https?://" buffer-file-name)))
+    (set-visited-file-modtime)))
 
 (defun braid-mode--on-kill ()
   "Clean up braid connection when the buffer is killed."
@@ -235,52 +226,19 @@ Enable with `braid-connect'; disable to close the connection."
 
 
 ;;;; ======================================================================
-;;;; braidfs path → URL parsing
+;;;; URL parsing
 ;;;; ======================================================================
 
-(defcustom braid-http-dir (expand-file-name "~/http/")
-  "Root directory that braidfs maps to HTTP URLs.
-Files under this directory are reachable as
-  http://<first-component>/<rest-of-path>
-where <first-component> may include a port, e.g. \"localhost:8888\"."
-  :type 'directory
-  :group 'braid)
-
-(defun braid-live--parse-path (file)
-  "Parse FILE (under `braid-http-dir') into (host port path).
-Returns nil if FILE is not under `braid-http-dir', or if the file
-is directly inside `braid-http-dir' (not in a subdirectory), or if
-the first path component is a dotfile (e.g. .braidfs)."
-  (let ((root (file-name-as-directory (expand-file-name braid-http-dir))))
-    (when (string-prefix-p root file)
-      (let* ((rel        (substring file (length root)))
-             (slash      (string-match "/" rel)))
-        (when (and slash (> slash 0) (not (string-prefix-p "." rel)))
-          (let* ((domain     (substring rel 0 slash))
-                 (path-rest  (substring rel slash))
-                 (colon      (string-match ":" domain))
-                 (host       (if colon (substring domain 0 colon) domain))
-                 (tls        (not (member host '("localhost" "127.0.0.1" "::1"))))
-                 (port       (cond (colon (string-to-number (substring domain (1+ colon))))
-                                   (tls   443)
-                                   (t     80))))
-            (list host port path-rest tls)))))))
-
-;;;###autoload
-(defun braid-live ()
-  "Toggle live sync for a buffer whose file lives under `braid-http-dir'.
-Derives host, port, and path from the file path following the braidfs
-convention: ~/http/<host>:<port>/<path>  →  http://<host>:<port>/<path>.
-Calls `braid-connect' to start syncing, or disables `braid-mode' if
-already connected."
-  (interactive)
-  (if braid-mode
-      (braid-mode -1)
-    (let* ((file   (buffer-file-name))
-           (parsed (and file (braid-live--parse-path file))))
-      (if parsed
-          (apply #'braid-connect parsed)
-        (user-error "Buffer file is not under %s" braid-http-dir)))))
+(defun braid-mode--parse-url (url)
+  "Parse URL into (host port path tls)."
+  (require 'url-parse)
+  (let* ((obj (url-generic-parse-url url))
+         (tls (equal (url-type obj) "https"))
+         (host (url-host obj))
+         (port (url-port obj))
+         (path (let ((f (url-filename obj)))
+                 (if (or (null f) (string-empty-p f)) "/" f))))
+    (list host port path tls)))
 
 
 ;;;; ======================================================================
@@ -348,85 +306,130 @@ rather than a server that is simply not running."
                                                        (braid-mode--on-disconnect)))))
                             (setq braid-mode--bc (braid-cursors-open braid-mode--bt)))))))))
 
-;;;###autoload
-(defun braid-connect (host port path &optional tls)
-  "Connect the current buffer to a braid-text resource at HOST:PORT/PATH.
-If TLS is non-nil, use a TLS connection.
-Enables `braid-mode' and begins syncing.  The server's current content
-is applied to the buffer once the subscription is established."
-  (interactive
-   (list (read-string (format "Host (default %s): " braid-default-host)
-                      nil nil braid-default-host)
-         (read-number "Port: " braid-default-port)
-         (read-string "Path: " (concat "/text/" (buffer-name)))
-         nil))
-  ;; Close any existing connection first
-  (when braid-mode--bc
-    (braid-cursors-close braid-mode--bc)
-    (setq braid-mode--bc nil))
-  (when braid-mode--bt
-    (braid-text-close braid-mode--bt)
-    (setq braid-mode--bt nil))
-  ;; Reset fallback state
-  (setq braid-mode--ever-connected nil)
-  (setq braid-mode--tls-fallback-tried nil)
-  (braid-mode 1)
-  (let ((buf (current-buffer)))
-    (setq braid-mode--bt (braid-text-open host port path buf
-                                          :tls tls
-                                          :on-connect
-                                          (lambda ()
-                                            (with-current-buffer buf
-                                              (braid-mode--on-connect)))
-                                          :on-disconnect
-                                          (lambda ()
-                                            (with-current-buffer buf
-                                              (braid-mode--on-disconnect)))))
-    ;; Start cursor sharing
-    (setq braid-mode--bc (braid-cursors-open braid-mode--bt))
-    ;; Set initial reconnect cap based on whether this buffer is focused.
-    (let* ((focused (eq buf (window-buffer (selected-window))))
-           (max-d   (if focused
-                        braid-reconnect-max-delay-foreground
-                      braid-reconnect-max-delay-background)))
-      (setf (braid-http-sub-reconnect-max-delay (braid-text-sub braid-mode--bt))
-            max-d)))
-  (message "Braid: connecting to %s://%s%s%s" (if tls "https" "http") host
-           (if (or (and tls (= port 443)) (and (not tls) (= port 80)))
-               ""
-             (format ":%d" port))
-           path))
+(defun braid-connect (url)
+  "Connect the current buffer to the braid-text resource at URL.
+URL is an http:// or https:// URL string."
+  (pcase-let ((`(,host ,port ,path ,tls) (braid-mode--parse-url url)))
+    ;; Close any existing connection first
+    (when braid-mode--bc
+      (braid-cursors-close braid-mode--bc)
+      (setq braid-mode--bc nil))
+    (when braid-mode--bt
+      (braid-text-close braid-mode--bt)
+      (setq braid-mode--bt nil))
+    ;; Reset fallback state
+    (setq braid-mode--ever-connected nil)
+    (setq braid-mode--tls-fallback-tried nil)
+    (braid-mode 1)
+    (let ((buf (current-buffer)))
+      (setq braid-mode--bt (braid-text-open host port path buf
+                                            :tls tls
+                                            :on-connect
+                                            (lambda ()
+                                              (with-current-buffer buf
+                                                (braid-mode--on-connect)))
+                                            :on-disconnect
+                                            (lambda ()
+                                              (with-current-buffer buf
+                                                (braid-mode--on-disconnect)))))
+      ;; Start cursor sharing
+      (setq braid-mode--bc (braid-cursors-open braid-mode--bt))
+      ;; Set initial reconnect cap based on whether this buffer is focused.
+      (let* ((focused (eq buf (window-buffer (selected-window))))
+             (max-d   (if focused
+                          braid-reconnect-max-delay-foreground
+                        braid-reconnect-max-delay-background)))
+        (setf (braid-http-sub-reconnect-max-delay (braid-text-sub braid-mode--bt))
+              max-d)))
+    (message "Braid: connecting to %s" url)))
 
 
 ;;;; ======================================================================
-;;;; Auto-enable for ~/http/ files
+;;;; URL file-name-handler
 ;;;; ======================================================================
 
-(defun braid-mode--maybe-auto-live ()
-  "Enable `braid-live' automatically for files under `braid-http-dir'."
+(defconst braid-mode--url-regexp "\\`https?://"
+  "Regexp matching HTTP/HTTPS URLs for file-name-handler-alist.")
+
+(defun braid-mode--file-handler (operation &rest args)
+  "Handle file operations on http:// and https:// URLs."
+  (pcase operation
+    ('expand-file-name
+     (if (string-match-p "\\`https?://" (car args))
+         (car args)
+       ;; Non-URL relative path with a URL default-directory —
+       ;; expand against home instead of the URL.
+       (let ((inhibit-file-name-handlers
+              (cons 'braid-mode--file-handler inhibit-file-name-handlers))
+             (inhibit-file-name-operation 'expand-file-name))
+         (expand-file-name (car args)
+                           (if (and (nth 1 args)
+                                    (string-match-p "\\`https?://" (nth 1 args)))
+                               "~/"
+                             (nth 1 args))))))
+    ('file-truename (car args))
+    ('file-name-directory
+     (let ((url (car args)))
+       (if (string-match "\\(https?://[^/]+/\\).*/" url)
+           (match-string 0 url)
+         (and (string-match "\\(https?://[^/]+\\)" url)
+              (concat (match-string 1 url) "/")))))
+    ('file-name-nondirectory
+     (if (string-match "/\\([^/]*\\)\\'" (car args))
+         (match-string 1 (car args))
+       ""))
+    ('insert-file-contents
+     (when (nth 1 args)  ; visit flag
+       (setq buffer-file-name (car args)))
+     (list (car args) 0))
+    ('write-region (list (nth 2 args) 0))
+    ('file-exists-p t)
+    ('file-readable-p t)
+    ('file-writable-p t)
+    ('file-directory-p nil)
+    ('file-remote-p nil)
+    ('file-regular-p t)
+    ('file-modes #o644)
+    ('file-attributes nil)
+    ('verify-visited-file-modtime t)
+    ('set-visited-file-modtime nil)
+    ('make-auto-save-file-name "")
+    ('file-newer-than-file-p nil)
+    ('file-name-sans-versions (car args))
+    ('vc-registered nil)
+    ('abbreviate-file-name (car args))
+    ('substitute-in-file-name (car args))
+    ('directory-file-name
+     (let ((url (car args)))
+       (if (and (> (length url) 0) (string-suffix-p "/" url))
+           (substring url 0 -1)
+         url)))
+    ('file-name-as-directory
+     (let ((url (car args)))
+       (if (string-suffix-p "/" url) url (concat url "/"))))
+    ('unhandled-file-name-directory nil)
+    (_
+     (let ((inhibit-file-name-handlers
+            (cons 'braid-mode--file-handler inhibit-file-name-handlers))
+           (inhibit-file-name-operation operation))
+       (apply operation args)))))
+
+(add-to-list 'file-name-handler-alist
+             (cons braid-mode--url-regexp #'braid-mode--file-handler))
+
+
+;;;; ======================================================================
+;;;; Auto-connect for URL buffers
+;;;; ======================================================================
+
+(defun braid-mode--maybe-auto-connect ()
+  "Auto-connect braid-text for URL buffers opened with find-file."
   (when (and buffer-file-name
-             (braid-live--parse-path buffer-file-name))
-    (braid-live)))
+             (string-match-p braid-mode--url-regexp buffer-file-name)
+             (not braid-mode))
+    (braid-connect buffer-file-name)))
 
-;;;###autoload
-(defun braid-mode-auto-live-setup ()
-  "Enable automatic `braid-live' for files opened under `braid-http-dir'.
-Call this in your init file, or use `braid-mode-auto-live' custom variable."
-  (add-hook 'find-file-hook #'braid-mode--maybe-auto-live))
-
-(defcustom braid-mode-auto-live t
-  "If non-nil, automatically enable `braid-live' for files under `braid-http-dir'."
-  :type 'boolean
-  :group 'braid
-  :set (lambda (sym val)
-         (set-default sym val)
-         (if val
-             (add-hook 'find-file-hook #'braid-mode--maybe-auto-live)
-           (remove-hook 'find-file-hook #'braid-mode--maybe-auto-live))))
-
-;; Activate immediately when this file is loaded, if the option is set.
-(when braid-mode-auto-live
-  (add-hook 'find-file-hook #'braid-mode--maybe-auto-live))
+(add-hook 'find-file-hook #'braid-mode--maybe-auto-connect)
 
 
 (provide 'braid-mode)

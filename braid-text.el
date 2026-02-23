@@ -329,8 +329,7 @@ from that version, or wait for a retry PUT to establish the version."
                   (unless (equal actual expected)
                     (message "Braid: DIGEST MISMATCH after version %s — reconnecting"
                              version)
-                    (braid-live)
-                    ;; (run-with-timer 0.1 nil #'braid-text--reconnect bt)
+                    (braid-text--reconnect bt)
                     )))
               ;; After receiving an ACK-like update, flush any accumulated edits
               ;; (important when throttling has been holding back sends).

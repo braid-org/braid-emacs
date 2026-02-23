@@ -56,8 +56,9 @@
 Returns non-nil if the server responds 200 with Content-Type
 containing application/text-cursors+json."
   (condition-case nil
-      (let* ((proc (open-network-stream
-                    "braid-cursor-head" " *braid-cursor-head*"
+      (let* ((buf  (generate-new-buffer " *braid-cursor-head*"))
+             (proc (open-network-stream
+                    "braid-cursor-head" buf
                     host port
                     :type (if tls 'tls 'plain)))
              (request (concat (format "HEAD %s HTTP/1.1\r\n" path)
@@ -69,10 +70,9 @@ containing application/text-cursors+json."
              (response ""))
         (process-send-string proc request)
         (while (accept-process-output proc 5))
-        (setq response (with-current-buffer (process-buffer proc)
-                         (buffer-string)))
+        (setq response (with-current-buffer buf (buffer-string)))
         (delete-process proc)
-        (kill-buffer (process-buffer proc))
+        (kill-buffer buf)
         (and (string-match-p "HTTP/[0-9.]+ 200" response)
              (let ((case-fold-search t))
                (string-match-p "content-type:.*application/text-cursors\\+json"
