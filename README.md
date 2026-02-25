@@ -23,7 +23,7 @@ Implements HTTP with a raw TLS over TCP connection and reads/writes Braid-HTTP i
 Open any braid-text resource directly:
 
     C-x C-f http://localhost:8888/text/notes RET
-    C-x C-f https://example.com/my-document RET
+    C-x C-f https://dt.braid.org/foo RET
 
 braid-emacs automatically connects and starts syncing. The modeline
 shows `●●` when connected and synced, `○○` when edits are pending,
