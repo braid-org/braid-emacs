@@ -136,7 +136,18 @@ When an update arrives with `version` and `parents`:
 2. **Apply the update**:
    - If the update has `patches`, apply them to the buffer/state.
      Each patch replaces `[start:end)` with the patch content.
-     Note each patch's `start` and `end` is with respect to the original buffer/state; not to the buffer/state after the application of the previous patch.
+     **Important: Patches use absolute positions.** Each patch's `start` and
+     `end` refer to positions in the original state (before any patches in this
+     update are applied), not to the state after previous patches. When applying
+     patches sequentially, maintain a running offset to adjust positions:
+     ```
+     offset = 0
+     for each patch:
+         adjusted_start = patch.start + offset
+         adjusted_end   = patch.end   + offset
+         apply replacement at [adjusted_start:adjusted_end)
+         offset += length(patch.content) - (patch.end - patch.start)
+     ```
    - If the update has a full `body` (no patches), replace the entire state.
      This normally only happens on initial connection (when `client_version`
      is the empty array).
@@ -286,6 +297,18 @@ Why this works:
 - The diff is computed against `client_state`, which was set after the last
   successful PUT — so the batched diff captures everything since then.
 
+# PUT Response Status Codes
+
+The server responds to each PUT with a status code. The client should handle:
+
+| Status | Meaning | Client action |
+|--------|---------|---------------|
+| 2xx | Success | Decrement `outstanding_puts`. Flush accumulated edits. |
+| 309 | **Version Unknown Here** — the server does not have the parents referenced by this PUT. This can happen when PUTs arrive out of order, or the server has not yet received an earlier PUT in the version chain. The server includes a `Retry-After` header. | Decrement `outstanding_puts`. Retry after the indicated delay (default 1s) by flushing — the flush re-diffs and re-sends, which will include the lost edit. |
+| 503 | **Server overloaded** — backpressure signal. | Decrement `outstanding_puts`. Enter a mute period (e.g. 3 seconds) during which no PUTs are sent. Flush after the mute expires. |
+| 550 | **Permanent rejection** — the server has determined the edit is invalid (e.g. repr-digest mismatch on the server side). | **Fatal error.** Stop syncing, close connections, alert the user. The edit is unrecoverable. |
+| Other 4xx/5xx | Transient or unexpected error. | Decrement `outstanding_puts`. Retry after a delay (e.g. 1s) by flushing. |
+
 # Protocol Details
 
 ## Version Format
@@ -393,6 +416,38 @@ The client checks: `parents ["abc123-0"] == client_version ["abc123-0"]`? Yes.
 Applies the patch. Buffer becomes "hello dear world!".
 
 Client state after: `client_version = ["server-43"]`, `client_state = "hello dear world!"`
+
+### Example 3b: Multi-Patch Update (Absolute Positions)
+
+If multiple concurrent edits are merged, the server may send multiple patches
+in a single update. Patches use **absolute positions** — all relative to the
+original state before any patches are applied.
+
+Given `client_state = "abcdefghij"` (10 chars), the server sends:
+
+```
+← 200 OK
+  Version: "server-44"
+  Parents: "abc123-0"
+  Patches: 2
+
+  Content-Range: text [2:4]
+  Content-Length: 3
+
+  XYZ
+
+  Content-Range: text [7:8]
+  Content-Length: 2
+
+  QR
+```
+
+Applying with offset tracking:
+1. Patch 1: replace `[2:4]` with "XYZ" → `"abXYZefghij"`, offset = 3-2 = +1
+2. Patch 2: replace `[7+1:8+1]` = `[8:9]` with "QR" → `"abXYZefgQRij"`
+
+Without offset tracking, patch 2 would incorrectly replace `[7:8]` in the
+already-modified string, producing `"abXYZefQRhij"` — **wrong**.
 
 ### Example 4: Reconnection
 

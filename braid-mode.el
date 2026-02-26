@@ -44,27 +44,35 @@
 
 (defvar-local braid-mode--bt nil
   "The `braid-text' struct syncing this buffer, or nil if not connected.")
+(put 'braid-mode--bt 'permanent-local t)
 
 (defvar-local braid-mode--bc nil
   "The `braid-cursor' struct for cursor sharing, or nil.")
+(put 'braid-mode--bc 'permanent-local t)
 
 (defvar-local braid-mode--ever-connected nil
   "Non-nil once the subscription has received a successful 209 response.")
+(put 'braid-mode--ever-connected 'permanent-local t)
 
 (defvar-local braid-mode--tls-fallback-tried nil
   "Non-nil if we already tried flipping TLS/plain to prevent infinite loops.")
+(put 'braid-mode--tls-fallback-tried 'permanent-local t)
 
 (defvar-local braid-mode--saved-auto-save-name nil
   "Saved `buffer-auto-save-file-name' restored when `braid-mode' is disabled.")
+(put 'braid-mode--saved-auto-save-name 'permanent-local t)
 
 (defvar-local braid-mode--saved-backup nil
   "Saved `make-backup-files' value restored when `braid-mode' is disabled.")
+(put 'braid-mode--saved-backup 'permanent-local t)
 
 (defvar-local braid-mode--saved-create-lockfiles nil
   "Saved `create-lockfiles' value restored when `braid-mode' is disabled.")
+(put 'braid-mode--saved-create-lockfiles 'permanent-local t)
 
 (defvar-local braid-mode--saved-auto-revert nil
   "Non-nil if `auto-revert-mode' was active before `braid-mode' was enabled.")
+(put 'braid-mode--saved-auto-revert 'permanent-local t)
 
 
 ;;;; ======================================================================
@@ -73,6 +81,7 @@
 
 (defvar-local braid-mode--saved-mode-line-modified nil
   "Saved `mode-line-modified' value restored when `braid-mode' is disabled.")
+(put 'braid-mode--saved-mode-line-modified 'permanent-local t)
 
 (defun braid-mode--on-window-selection-change (_frame)
   "Adjust reconnect-max-delay for braid buffers based on window focus.
@@ -101,7 +110,7 @@ and ** when disconnected."
                        ((not (eq (braid-http-sub-status (braid-text-sub braid-mode--bt))
                                  :connected))
                         "**")
-                       ((> (braid-text-pending-puts braid-mode--bt) 0)
+                       ((> (braid-text-outstanding-changes braid-mode--bt) 0)
                         "○○")
                        (t "●●")))))
 
@@ -158,6 +167,32 @@ to the buffer.  This is expected and not a real conflict."
     (remove-hook 'window-selection-change-functions
                  #'braid-mode--on-window-selection-change)))
 
+(defun braid-mode--install-hooks ()
+  "Install buffer-local hooks needed by braid-mode.
+Called on enable and after major-mode changes (which kill buffer-local hooks)."
+  (add-hook 'after-change-functions #'braid-mode--after-change nil t)
+  (add-hook 'kill-buffer-hook #'braid-mode--on-kill nil t))
+
+(defun braid-mode--after-major-mode-change ()
+  "Re-install braid-mode setup after a major-mode change.
+Major modes call `kill-all-local-variables' which strips buffer-local hooks.
+Our state variables survive (they are permanent-local), but the hooks and
+mode-line indicator need to be re-installed."
+  (when braid-mode
+    (braid-mode--install-hooks)
+    (braid-mode--install-indicator)
+    ;; Re-suppress auto-save, backups, lockfiles
+    (setq buffer-auto-save-file-name nil)
+    (make-local-variable 'make-backup-files)
+    (setq make-backup-files nil)
+    (make-local-variable 'create-lockfiles)
+    (setq create-lockfiles nil)
+    (local-set-key (kbd "C-x C-s") #'braid-mode--save-noop)))
+
+;; This hook runs after every major-mode change in every buffer.
+;; The body checks braid-mode first, so it's a no-op for non-braid buffers.
+(add-hook 'after-change-major-mode-hook #'braid-mode--after-major-mode-change)
+
 ;;;###autoload
 (define-minor-mode braid-mode
   "Minor mode to sync the current buffer with a Braid-HTTP server.
@@ -166,8 +201,7 @@ Enable with `braid-connect'; disable to close the connection."
   :group 'braid
   (if braid-mode
       (progn
-        (add-hook 'after-change-functions #'braid-mode--after-change nil t)
-        (add-hook 'kill-buffer-hook #'braid-mode--on-kill nil t)
+        (braid-mode--install-hooks)
         ;; Install focus-change hook (global, shared by all braid buffers).
         (add-hook 'window-selection-change-functions
                   #'braid-mode--on-window-selection-change)
@@ -223,6 +257,9 @@ Enable with `braid-connect'; disable to close the connection."
       (braid-text-close braid-mode--bt)
       (setq braid-mode--bt nil)
       (message "Braid: disconnected."))))
+
+;; Survive major-mode changes (kill-all-local-variables).
+(put 'braid-mode 'permanent-local t)
 
 
 ;;;; ======================================================================

@@ -12,6 +12,7 @@
 (require 'ert)
 (require 'braid-http)
 (require 'braid-text)
+(require 'braid-cursors)
 
 
 ;;;; ======================================================================
@@ -28,7 +29,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
                 :stage :sub-headers
                 :body-buf body-str
                 :on-message (lambda (msg) (push msg messages)))))
-      (braid-http--pump sub))
+      (braid-http-parser--read sub))
     (nreverse messages)))
 
 
@@ -48,22 +49,22 @@ into the sub-headers parser, simulating what arrives after dechunking."
   (should (equal (braid-http--format-version '()) "")))
 
 (ert-deftest braid-parse-version/single ()
-  (should (equal (braid-http--parse-version "\"server-0\"")
+  (should (equal (braid-http-parse-version "\"server-0\"")
                  '("server-0"))))
 
 (ert-deftest braid-parse-version/multiple ()
-  (should (equal (braid-http--parse-version "\"v1\", \"v2\"")
+  (should (equal (braid-http-parse-version "\"v1\", \"v2\"")
                  '("v1" "v2"))))
 
 (ert-deftest braid-parse-version/nil ()
-  (should (null (braid-http--parse-version nil))))
+  (should (null (braid-http-parse-version nil))))
 
 (ert-deftest braid-parse-version/empty-string ()
-  (should (null (braid-http--parse-version ""))))
+  (should (null (braid-http-parse-version ""))))
 
 (ert-deftest braid-format-parse-version/roundtrip ()
   (let ((versions '("a3f9b2-7" "other-12")))
-    (should (equal (braid-http--parse-version
+    (should (equal (braid-http-parse-version
                     (braid-http--format-version versions))
                    versions))))
 
@@ -73,20 +74,20 @@ into the sub-headers parser, simulating what arrives after dechunking."
 ;;;; ======================================================================
 
 (ert-deftest braid-parse-content-range/basic ()
-  (should (equal (braid-http--parse-content-range "text [7:12]")
+  (should (equal (braid-http-parse-content-range "text [7:12]")
                  '("text" 7 12))))
 
 (ert-deftest braid-parse-content-range/zero-length ()
-  (should (equal (braid-http--parse-content-range "text [0:0]")
+  (should (equal (braid-http-parse-content-range "text [0:0]")
                  '("text" 0 0))))
 
 (ert-deftest braid-parse-content-range/deletion ()
   "A deletion has no content (handled by body) but range end > start."
-  (should (equal (braid-http--parse-content-range "text [9:13]")
+  (should (equal (braid-http-parse-content-range "text [9:13]")
                  '("text" 9 13))))
 
 (ert-deftest braid-parse-content-range/nil ()
-  (should (null (braid-http--parse-content-range nil))))
+  (should (null (braid-http-parse-content-range nil))))
 
 
 ;;;; ======================================================================
@@ -299,7 +300,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
       (setf (braid-http-sub-body-buf sub)
             (concat (braid-http-sub-body-buf sub)
                     (substring full-stream i (1+ i))))
-      (braid-http--pump sub))
+      (braid-http-parser--read sub))
     (setq messages (nreverse messages))
     (should (= (length messages) 1))
     (should (equal (plist-get (car messages) :body) "hello"))))
@@ -407,7 +408,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
               :stage :outer-headers
               :raw-buf "HTTP/1.1 209 \r\n\r\n"
               :on-message (lambda (_)))))
-    (braid-http--pump sub)
+    (braid-http-parser--read sub)
     (unwind-protect
         (progn
           (should (braid-http-sub-heartbeat-timer sub))
@@ -424,7 +425,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
               :stage :outer-headers
               :raw-buf "HTTP/1.1 209 \r\n\r\n"
               :on-message (lambda (_)))))
-    (braid-http--pump sub)
+    (braid-http-parser--read sub)
     (should (null (braid-http-sub-heartbeat-timer sub)))))
 
 (ert-deftest braid-heartbeat/unsubscribe-cancels-timer ()
@@ -436,7 +437,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
               :stage :outer-headers
               :raw-buf "HTTP/1.1 209 \r\n\r\n"
               :on-message (lambda (_)))))
-    (braid-http--pump sub)
+    (braid-http-parser--read sub)
     (should (braid-http-sub-heartbeat-timer sub))
     (braid-http-unsubscribe sub)
     (should (null (braid-http-sub-heartbeat-timer sub)))))
@@ -473,7 +474,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
 ;;;; ======================================================================
 
 (ert-deftest braid-put-ack/timer-starts-on-first-put ()
-  "PUT ACK timer starts when pending-puts transitions from 0 to >0."
+  "PUT ACK timer starts when outstanding-changes transitions from 0 to >0."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
@@ -484,9 +485,9 @@ into the sub-headers parser, simulating what arrives after dechunking."
         (progn
           (with-current-buffer buf (insert "hello"))
           (should (null (braid-text-put-ack-timer bt)))
-          (braid-text--flush bt)
+          (braid-text--changed bt)
           (should (braid-text-put-ack-timer bt))
-          (should (= (braid-text-pending-puts bt) 1)))
+          (should (= (braid-text-outstanding-changes bt) 1)))
       (when (braid-text-put-ack-timer bt)
         (cancel-timer (braid-text-put-ack-timer bt)))
       (kill-buffer buf))))
@@ -502,7 +503,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
     (unwind-protect
         (progn
           (with-current-buffer buf (insert "hello"))
-          (braid-text--flush bt)
+          (braid-text--changed bt)
           (let ((first-timer (braid-text-put-ack-timer bt)))
             (should first-timer)
             ;; Make another edit
@@ -510,10 +511,10 @@ into the sub-headers parser, simulating what arrives after dechunking."
               (goto-char (point-max))
               (let ((inhibit-modification-hooks t))
                 (insert "!")))
-            (braid-text--flush bt)
+            (braid-text--changed bt)
             ;; Same timer, not a new one
             (should (eq (braid-text-put-ack-timer bt) first-timer))
-            (should (= (braid-text-pending-puts bt) 2))))
+            (should (= (braid-text-outstanding-changes bt) 2))))
       (when (braid-text-put-ack-timer bt)
         (cancel-timer (braid-text-put-ack-timer bt)))
       (kill-buffer buf))))
@@ -527,7 +528,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
-               :pending-puts 3
+               :outstanding-changes 3
                :put-ack-timer (run-with-timer 999 nil #'ignore)
                :sub sub))
          (reconnect-called nil))
@@ -567,7 +568,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
 
 (ert-deftest braid-reconnect/preserves-client-version ()
   "braid-text--reconnect does NOT reset client-version.
-Offline edits are flushed on-connect (after the subscription establishes),
+Offline edits are sent on-connect (after the subscription establishes),
 not during reconnect itself."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (sub (make-braid-http-sub
@@ -587,16 +588,16 @@ not during reconnect itself."
                     ((symbol-function 'braid-text--put-proc-open)
                      (lambda (_bt) nil)))
             (braid-text--reconnect bt))
-          ;; Version is preserved (not reset to nil) — flush happens
+          ;; Version is preserved (not reset to nil) — changed() is called
           ;; later in on-connect when the subscription establishes.
           (should (equal (braid-text-client-version bt) '("v0")))
-          ;; pending-puts reset to 0
-          (should (= (braid-text-pending-puts bt) 0)))
+          ;; outstanding-changes reset to 0
+          (should (= (braid-text-outstanding-changes bt) 0)))
       (kill-buffer buf))))
 
-(ert-deftest braid-reconnect/resets-pending-puts ()
-  "braid-text--reconnect resets pending-puts and cancels ACK timer.
-When no offline edits exist, pending-puts stays at 0 after reset."
+(ert-deftest braid-reconnect/resets-outstanding-changes ()
+  "braid-text--reconnect resets outstanding-changes and cancels ACK timer.
+When no offline edits exist, outstanding-changes stays at 0 after reset."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (sub (make-braid-http-sub
                :host "127.0.0.1" :port 8888 :path "/test"
@@ -604,7 +605,7 @@ When no offline edits exist, pending-puts stays at 0 after reset."
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
-               :pending-puts 5
+               :outstanding-changes 5
                :put-ack-timer (run-with-timer 999 nil #'ignore)
                :client-version '("v0")
                :client-state ""
@@ -615,9 +616,9 @@ When no offline edits exist, pending-puts stays at 0 after reset."
                   ((symbol-function 'braid-text--put-proc-open)
                    (lambda (_bt) nil)))
           (braid-text--reconnect bt)
-          ;; No offline edits (buffer = client-state = ""), so pending-puts
-          ;; was reset to 0 and the flush was a no-op.
-          (should (= (braid-text-pending-puts bt) 0))
+          ;; No offline edits (buffer = client-state = ""), so outstanding-changes
+          ;; was reset to 0 and changed() was a no-op.
+          (should (= (braid-text-outstanding-changes bt) 0))
           (should (null (braid-text-put-ack-timer bt))))
       (when (braid-text-put-ack-timer bt)
         (cancel-timer (braid-text-put-ack-timer bt)))
@@ -627,26 +628,26 @@ When no offline edits exist, pending-puts stays at 0 after reset."
 ;;;; PUT throttling
 ;;;; ======================================================================
 
-(ert-deftest braid-throttle/flush-suppressed-at-max ()
-  "Flushes are suppressed when pending-puts >= max-outstanding-puts."
+(ert-deftest braid-throttle/changed-suppressed-at-max ()
+  "changed() is suppressed when outstanding-changes >= max-outstanding-changes."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
                :client-state "old"
                :client-version '("v0")
-               :pending-puts 10
-               :max-outstanding-puts 10)))
+               :outstanding-changes 10
+               :max-outstanding-changes 10)))
     (unwind-protect
         (progn
           (with-current-buffer buf (insert "new text"))
-          (braid-text--flush bt)
+          (braid-text--changed bt)
           ;; No PUT should have been sent — still at 10
-          (should (= (braid-text-pending-puts bt) 10)))
+          (should (= (braid-text-outstanding-changes bt) 10)))
       (kill-buffer buf))))
 
-(ert-deftest braid-throttle/flush-suppressed-when-muted ()
-  "Flushes are suppressed during 503 backpressure mute period."
+(ert-deftest braid-throttle/changed-suppressed-when-muted ()
+  "changed() is suppressed during 503 backpressure mute period."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (bt  (make-braid-text
                :host "127.0.0.1" :port 8888 :path "/test"
@@ -657,9 +658,9 @@ When no offline edits exist, pending-puts stays at 0 after reset."
     (unwind-protect
         (progn
           (with-current-buffer buf (insert "new text"))
-          (braid-text--flush bt)
+          (braid-text--changed bt)
           ;; No PUT should have been sent
-          (should (= (braid-text-pending-puts bt) 0)))
+          (should (= (braid-text-outstanding-changes bt) 0)))
       (kill-buffer buf))))
 
 (ert-deftest braid-throttle/mute-clears-after-expiry ()
@@ -674,10 +675,79 @@ When no offline edits exist, pending-puts stays at 0 after reset."
     (unwind-protect
         (progn
           (with-current-buffer buf (insert "old"))
-          (braid-text--flush bt)
+          (braid-text--changed bt)
           ;; Mute should have been cleared (time expired)
           (should (null (braid-text-muted-until bt))))
       (kill-buffer buf))))
+
+
+;;;; ======================================================================
+;;;; Network failure resilience
+;;;; ======================================================================
+
+(ert-deftest braid-reconnect/put-proc-handles-network-error ()
+  "braid-text--put-proc-reconnect catches network errors and retries."
+  (let* ((buf (generate-new-buffer " *braid-test*"))
+         (attempt-count 0)
+         (bt  (make-braid-text
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test" :buffer buf
+               :client-state "" :client-version '("v0"))))
+    (unwind-protect
+        ;; Mock put-proc-open to fail with a DNS-like error
+        (cl-letf (((symbol-function 'braid-text--put-proc-open)
+                   (lambda (_bt)
+                     (cl-incf attempt-count)
+                     (error "nodename nor servname provided"))))
+          ;; Should NOT signal — error is caught and retry scheduled
+          (braid-text--put-proc-reconnect bt)
+          (should (= attempt-count 1))
+          ;; put-proc should still be nil (open failed)
+          (should (null (braid-text-put-proc bt))))
+      (kill-buffer buf))))
+
+(ert-deftest braid-reconnect/subscription-handles-network-error ()
+  "braid-http--schedule-reconnect catches network errors on reconnect."
+  (let* ((attempt-count 0)
+         (sub (make-braid-http-sub
+               :host "127.0.0.1" :port 8888 :path "/test"
+               :peer "test" :status :disconnected
+               :reconnect-delay 0.01 :reconnect-max-delay 1.0)))
+    (unwind-protect
+        ;; Mock braid-http--open to fail with a network error
+        (cl-letf (((symbol-function 'braid-http--open)
+                   (lambda (_sub _parents)
+                     (cl-incf attempt-count)
+                     (error "nodename nor servname provided"))))
+          ;; Schedule reconnect — should NOT signal
+          (braid-http--schedule-reconnect sub)
+          ;; Let the timer fire
+          (accept-process-output nil 0.1)
+          (should (= attempt-count 1))
+          ;; Status should still be :disconnected (open failed)
+          (should (eq (braid-http-sub-status sub) :disconnected))
+          ;; A new reconnect timer should be scheduled (retry)
+          (should (braid-http-sub-reconnect-timer sub)))
+      (when (braid-http-sub-reconnect-timer sub)
+        (cancel-timer (braid-http-sub-reconnect-timer sub))))))
+
+(ert-deftest braid-reconnect/cursors-put-proc-handles-network-error ()
+  "braid-cursors--put-proc-reconnect catches network errors and retries."
+  (let* ((attempt-count 0)
+         (bc  (make-braid-cursor
+               :bt (make-braid-text
+                    :host "127.0.0.1" :port 8888 :path "/test"
+                    :peer "test" :client-state "" :client-version nil))))
+    ;; Mock put-proc-open to fail with a DNS-like error
+    (cl-letf (((symbol-function 'braid-cursors--put-proc-open)
+               (lambda (_bc)
+                 (cl-incf attempt-count)
+                 (error "nodename nor servname provided"))))
+      ;; Should NOT signal — error is caught and retry scheduled
+      (braid-cursors--put-proc-reconnect bc)
+      (should (= attempt-count 1))
+      ;; put-proc should still be nil
+      (should (null (braid-cursor-put-proc bc))))))
 
 
 ;;;; ======================================================================
@@ -723,7 +793,7 @@ Prints PASS/FAIL for each step and exits with code 0 or 1."
       ;; 2. First PUT: insert "hello" at start, wait for echo with correct content
       (unless fail
         (setq messages nil)
-        (braid-put "127.0.0.1" 8888 path
+        (braid-http-put "127.0.0.1" 8888 path
                    '("tc-5") '()
                    '(:range (:unit "text" :start 0 :end 0) :content "hello"))
         (wait (lambda () messages) 3.0 "received echo of first PUT")
@@ -742,7 +812,7 @@ Prints PASS/FAIL for each step and exits with code 0 or 1."
         (let* ((echo-version (plist-get (car (last messages)) :version))
                (_ (setq messages nil))
                (_ (accept-process-output nil 0.5))) ; deliberate delay
-          (braid-put "127.0.0.1" 8888 path
+          (braid-http-put "127.0.0.1" 8888 path
                      '("tc-10") echo-version
                      '(:range (:unit "text" :start 5 :end 5) :content " world")
                      :on-done  (lambda (status) (message "DEBUG: second PUT status: %d" status))
@@ -757,7 +827,7 @@ Prints PASS/FAIL for each step and exits with code 0 or 1."
                 (message "FAIL: second PUT echo content was %S, expected \" world\"" content)
                 (setq fail t))))))
 
-    (braid-unsubscribe sub)
+    (braid-http-unsubscribe sub)
     (kill-emacs (if fail 1 0)))))
 
 
@@ -802,8 +872,8 @@ Prints PASS/FAIL for each step and exits with code 0 or 1."
       (unless fail
         (with-current-buffer buf-a
           (let ((inhibit-modification-hooks t)) (insert "hello")))
-        (braid-text--flush bt-a)
-        (wait (lambda () (= (braid-text-pending-puts bt-a) 0)) 5.0
+        (braid-text--changed bt-a)
+        (wait (lambda () (= (braid-text-outstanding-changes bt-a) 0)) 5.0
               "A: PUT acked")
         (unless fail
           (wait (lambda () (equal (text-b) "hello")) 5.0
@@ -814,8 +884,8 @@ Prints PASS/FAIL for each step and exits with code 0 or 1."
         (with-current-buffer buf-b
           (let ((inhibit-modification-hooks t))
             (goto-char (point-max)) (insert " world")))
-        (braid-text--flush bt-b)
-        (wait (lambda () (= (braid-text-pending-puts bt-b) 0)) 5.0
+        (braid-text--changed bt-b)
+        (wait (lambda () (= (braid-text-outstanding-changes bt-b) 0)) 5.0
               "B: PUT acked")
         (unless fail
           (wait (lambda () (equal (text-a) "hello world")) 5.0
@@ -836,8 +906,8 @@ Prints PASS/FAIL for each step and exits with code 0 or 1."
         (with-current-buffer buf-b
           (let ((inhibit-modification-hooks t))
             (goto-char (point-max)) (insert " and goodbye")))
-        (braid-text--flush bt-b)
-        (wait (lambda () (= (braid-text-pending-puts bt-b) 0)) 5.0
+        (braid-text--changed bt-b)
+        (wait (lambda () (= (braid-text-outstanding-changes bt-b) 0)) 5.0
               "B: PUT acked while A is disconnected")
         (unless fail
           (message "  B buffer: %S" (text-b))))
@@ -909,8 +979,8 @@ treated stale buffer contents as local edits.  This test verifies:
       (unless fail
         (with-current-buffer buf-a
           (let ((inhibit-modification-hooks t)) (insert "aaa bbb")))
-        (braid-text--flush bt-a)
-        (wait (lambda () (= (braid-text-pending-puts bt-a) 0)) 5.0
+        (braid-text--changed bt-a)
+        (wait (lambda () (= (braid-text-outstanding-changes bt-a) 0)) 5.0
               "A: PUT acked")
         (unless fail
           (wait (lambda () (equal (text-b) "aaa bbb")) 5.0
@@ -941,8 +1011,8 @@ treated stale buffer contents as local edits.  This test verifies:
         (with-current-buffer buf-b
           (let ((inhibit-modification-hooks t))
             (goto-char (point-min)) (insert "zzz ")))
-        (braid-text--flush bt-b)
-        (wait (lambda () (= (braid-text-pending-puts bt-b) 0)) 5.0
+        (braid-text--changed bt-b)
+        (wait (lambda () (= (braid-text-outstanding-changes bt-b) 0)) 5.0
               "B: PUT acked while A is disconnected")
         (unless fail
           (message "  B buffer: %S" (text-b))))
@@ -967,8 +1037,8 @@ treated stale buffer contents as local edits.  This test verifies:
 
       ;; 9. Flush A's local edits to the server
       (unless fail
-        (braid-text--flush bt-a)
-        (wait (lambda () (= (braid-text-pending-puts bt-a) 0)) 5.0
+        (braid-text--changed bt-a)
+        (wait (lambda () (= (braid-text-outstanding-changes bt-a) 0)) 5.0
               "A: local edits PUT acked"))
 
       ;; 10. Wait for B to receive A's local edit, then check convergence

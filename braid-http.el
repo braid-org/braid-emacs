@@ -55,7 +55,7 @@ Looks up the formatted host (via `braid-http--format-host') in
 Example: (\"v1\" \"v2\") → \"\\\"v1\\\", \\\"v2\\\"\""
   (mapconcat (lambda (v) (format "%S" v)) versions ", "))
 
-(defun braid-http--parse-version (str)
+(defun braid-http-parse-version (str)
   "Parse a Structured Headers version value into a list of strings.
 Example: \"\\\"v1\\\", \\\"v2\\\"\" → (\"v1\" \"v2\").
 Returns nil for nil or empty input."
@@ -73,7 +73,7 @@ Returns nil for nil or empty input."
 ;;;; Content-Range header
 ;;;; ======================================================================
 
-(defun braid-http--parse-content-range (str)
+(defun braid-http-parse-content-range (str)
   "Parse a Content-Range header value.
 For text ranges: \"text [7:12]\" → (\"text\" 7 12).
 For json ranges: \"json [\\\"key\\\"]\" → (\"json\" \"key\").
@@ -98,7 +98,7 @@ Returns nil if STR is nil or doesn't match."
 ;;;; Header block parsing
 ;;;; ======================================================================
 
-(defun braid-http--parse-header-block (str)
+(defun braid-http-parse-header-block (str)
   "Parse a block of header lines (no status line, no trailing blank line).
 Returns an alist of (lowercase-name . value) pairs."
   (let (headers)
@@ -222,15 +222,15 @@ Returns (new-raw . new-body).  Partial chunks stay in new-raw."
 
 
 ;;;; ======================================================================
-;;;; Parse pump
+;;;; Subscription parser
 ;;;; ======================================================================
 
-(defun braid-http--pump (sub)
+(defun braid-http-parser--read (sub)
   "Drive SUB's parse state machine until no more progress can be made."
   ;; Phase 1: outer HTTP response headers (read from raw-buf)
   (when (eq (braid-http-sub-stage sub) :outer-headers)
-    (unless (braid-http--try-outer-headers sub)
-      (cl-return-from braid-http--pump nil)))
+    (unless (braid-http-parser--read-outer-headers sub)
+      (cl-return-from braid-http-parser--read nil)))
 
   ;; Phase 2: dechunk raw-buf → body-buf
   (let ((result (if (braid-http-sub-chunked sub)
@@ -247,13 +247,13 @@ Returns (new-raw . new-body).  Partial chunks stay in new-raw."
     (while keep-going
       (setq keep-going
             (pcase (braid-http-sub-stage sub)
-              (:sub-headers    (braid-http--try-sub-headers sub))
-              (:body           (braid-http--try-body sub))
-              (:patch-n-headers (braid-http--try-patch-n-headers sub))
-              (:patch-n-body    (braid-http--try-patch-n-body sub))
+              (:sub-headers    (braid-http-parser--read-sub-headers sub))
+              (:body           (braid-http-parser--read-body sub))
+              (:patch-n-headers (braid-http-parser--read-patch-n-headers sub))
+              (:patch-n-body    (braid-http-parser--read-patch-n-body sub))
               (_               nil))))))
 
-(defun braid-http--try-outer-headers (sub)
+(defun braid-http-parser--read-outer-headers (sub)
   "Try to parse the outer HTTP/1.1 response line and headers.
 On success, advances stage to :sub-headers (or :error) and returns t.
 Returns nil if more data is needed."
@@ -264,7 +264,7 @@ Returns nil if more data is needed."
              (sl     (car lines))  ; status line
              (status (when (string-match "HTTP/[^ ]+ \\([0-9]+\\)" sl)
                        (string-to-number (match-string 1 sl))))
-             (hdrs   (braid-http--parse-header-block
+             (hdrs   (braid-http-parse-header-block
                       (mapconcat #'identity (cdr lines) "\r\n")))
              (te     (cdr (assoc "transfer-encoding" hdrs))))
         (setf (braid-http-sub-raw-buf sub) (substring raw (+ end 4)))
@@ -299,7 +299,7 @@ Returns nil if more data is needed."
             (setf (braid-http-sub-stage       sub) :body)))
         t))))
 
-(defun braid-http--try-sub-headers (sub)
+(defun braid-http-parser--read-sub-headers (sub)
   "Try to parse the next sub-response status line and headers from body-buf.
 Returns t if a complete header block was parsed, nil if more data needed."
   (let ((buf (braid-http-sub-body-buf sub)))
@@ -312,7 +312,7 @@ Returns t if a complete header block was parsed, nil if more data needed."
       (let* ((block   (substring buf 0 end))
              (lines   (split-string block "\r\n"))
              ;; First line is the sub-response status ("200 OK"), rest are headers
-             (headers (braid-http--parse-header-block
+             (headers (braid-http-parse-header-block
                        (mapconcat #'identity (cdr lines) "\r\n")))
              (cl-str  (cdr (assoc "content-length" headers)))
              (cl      (if cl-str (string-to-number cl-str) 0)))
@@ -330,7 +330,7 @@ Returns t if a complete header block was parsed, nil if more data needed."
             (setf (braid-http-sub-stage sub) :body)))
         t))))
 
-(defun braid-http--try-body (sub)
+(defun braid-http-parser--read-body (sub)
   "Try to read the current sub-response's body (snapshot or single patch).
 Returns t if fully read, nil if more data needed."
   (let* ((buf (braid-http-sub-body-buf sub))
@@ -342,11 +342,11 @@ Returns t if fully read, nil if more data needed."
              (ver-str   (cdr (assoc "version"       headers)))
              (par-str   (cdr (assoc "parents"       headers)))
              (cr-str    (cdr (assoc "content-range" headers)))
-             (version   (braid-http--parse-version ver-str))
-             (parents   (braid-http--parse-version par-str))
+             (version   (braid-http-parse-version ver-str))
+             (parents   (braid-http-parse-version par-str))
              (msg       (list :version        version
                               :parents        parents
-                              :content-range  (braid-http--parse-content-range cr-str)
+                              :content-range  (braid-http-parse-content-range cr-str)
                               :content-length cl
                               :body           body-text
                               :patches        nil
@@ -359,24 +359,32 @@ Returns t if fully read, nil if more data needed."
           (funcall (braid-http-sub-on-message sub) msg))
         t))))
 
-(defun braid-http--try-patch-n-headers (sub)
+(defun braid-http-parser--read-patch-n-headers (sub)
   "Try to read one patch's headers within a Patches: N block.
 Returns t if parsed, nil if more data needed."
-  (let* ((buf (braid-http-sub-body-buf sub))
-         (end (string-match "\r\n\r\n" buf)))
+  (let* ((buf (braid-http-sub-body-buf sub)))
+    ;; Skip leading bare CRLFs (separators between patches in a Patches: N block).
+    ;; The server writes \r\n\r\n between patches (braid-http-server.js line 53-54).
+    (while (and (>= (length buf) 2) (string-prefix-p "\r\n" buf))
+      (setq buf (substring buf 2)))
+    (setf (braid-http-sub-body-buf sub) buf)
+    (let ((end (string-match "\r\n\r\n" buf)))
     (when end
       (let* ((block   (substring buf 0 end))
-             (headers (braid-http--parse-header-block block))
+             (headers (braid-http-parse-header-block block))
              (cl-str  (cdr (assoc "content-length" headers)))
              (cr-str  (cdr (assoc "content-range"  headers)))
              (cl      (if cl-str (string-to-number cl-str) 0)))
+        (when braid-text-debug
+          (message "Braid: patch-n-headers block=%S headers=%S cr-str=%S cl=%d"
+                   block headers cr-str cl))
         (setf (braid-http-sub-cur-cl       sub) cl)
-        (setf (braid-http-sub-cur-patch-cr sub) (braid-http--parse-content-range cr-str))
+        (setf (braid-http-sub-cur-patch-cr sub) (braid-http-parse-content-range cr-str))
         (setf (braid-http-sub-body-buf     sub) (substring buf (+ end 4)))
         (setf (braid-http-sub-stage        sub) :patch-n-body)
-        t))))
+        t)))))
 
-(defun braid-http--try-patch-n-body (sub)
+(defun braid-http-parser--read-patch-n-body (sub)
   "Try to read one patch's body within a Patches: N block.
 Returns t if read, nil if more data needed."
   (let* ((buf (braid-http-sub-body-buf sub))
@@ -397,8 +405,8 @@ Returns t if read, nil if more data needed."
           (let* ((headers  (braid-http-sub-cur-headers sub))
                  (ver-str  (cdr (assoc "version" headers)))
                  (par-str  (cdr (assoc "parents" headers)))
-                 (version  (braid-http--parse-version ver-str))
-                 (parents  (braid-http--parse-version par-str))
+                 (version  (braid-http-parse-version ver-str))
+                 (parents  (braid-http-parse-version par-str))
                  (patches  (nreverse (braid-http-sub-cur-patches-list sub)))
                  (msg      (list :version  version
                                  :parents  parents
@@ -480,11 +488,11 @@ the SENTINEL will be called with an \"open\" event when ready."
     (setf (braid-http-sub-process  sub) proc)))
 
 (defun braid-http--filter (sub _proc data)
-  "Process filter: accumulate DATA and pump the parser."
+  "Process filter: accumulate DATA and parse incoming updates."
   (setf (braid-http-sub-last-data-time sub) (float-time))
   (setf (braid-http-sub-raw-buf sub) (concat (braid-http-sub-raw-buf sub) data))
   (condition-case err
-      (braid-http--pump sub)
+      (braid-http-parser--read sub)
     (error
      (message "braid-http parse error: %S" err))))
 
@@ -516,9 +524,14 @@ the SENTINEL will be called with an \"open\" event when ready."
            delay nil
            (lambda ()
              (when (not (eq (braid-http-sub-status sub) :closed))
-               (braid-http--open sub (if (braid-http-sub-parents-fn sub)
-                                         (funcall (braid-http-sub-parents-fn sub))
-                                       (braid-http-sub-last-parents sub)))))))))
+               (condition-case err
+                   (braid-http--open sub (if (braid-http-sub-parents-fn sub)
+                                             (funcall (braid-http-sub-parents-fn sub))
+                                           (braid-http-sub-last-parents sub)))
+                 (error
+                  (message "Braid: reconnect failed (%s) — retrying"
+                           (error-message-string err))
+                  (braid-http--schedule-reconnect sub)))))))))
 
 (defun braid-http-expedite-reconnect (sub)
   "If SUB is disconnected, cancel its pending timer and reconnect immediately.
