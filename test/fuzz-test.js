@@ -7,10 +7,10 @@
 // state matches between JS and Emacs (and optionally server digest).
 //
 // Usage:
-//   cd test-server && node test-server.js &
+//   cd test && node test-server.js &
 //   node fuzz-test.js [rounds] [seed]
 //
-// Requires: test-server running on 127.0.0.1:8888
+// Requires: test server running on 127.0.0.1:8888
 
 var { spawn } = require('child_process')
 var readline = require('readline')

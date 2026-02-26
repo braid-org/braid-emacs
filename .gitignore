@@ -8,7 +8,7 @@
 braid-text-db/
 
 # Node.js test dependencies
-test-server/node_modules/
+test/node_modules/
 
 # Claude Code
 .claude/

@@ -1,5 +1,5 @@
 {
-  "name": "braid-emacs-test-server",
+  "name": "braid-emacs-test",
   "version": "1.0.0",
   "description": "Simple echo server for braid-http.el integration tests (no dependencies)",
   "main": "test-server.js",

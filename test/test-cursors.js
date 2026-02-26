@@ -6,10 +6,10 @@
 // transformed through text edits.
 //
 // Usage:
-//   cd test-server && node test-server.js &
+//   cd test && node test-server.js &
 //   node test-cursors.js
 //
-// Requires: test-server running on 127.0.0.1:8888
+// Requires: test server running on 127.0.0.1:8888
 
 var { spawn } = require('child_process')
 var readline = require('readline')

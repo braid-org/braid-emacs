@@ -15,14 +15,14 @@
 
 (defconst braid-stress--dir
   (file-name-directory (or load-file-name buffer-file-name default-directory))
-  "Directory containing this file and test-server/.")
+  "Directory containing this file and test/.")
 
 (defvar braid-stress--errors nil
   "List of error messages captured during the test.")
 
 (defun braid-stress--start-server ()
   "Start the local braid-text test server."
-  (let* ((script (expand-file-name "test-server/test-server.js" braid-stress--dir))
+  (let* ((script (expand-file-name "test/test-server.js" braid-stress--dir))
          (proc (start-process "braid-test-server" nil "node" script)))
     (set-process-query-on-exit-flag proc nil)
     proc))

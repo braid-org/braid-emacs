@@ -50,5 +50,5 @@ used independently of the live-editing mode:
 
 - **`braid-mode.el`** — minor mode, URL file handler, and auto-connect.
 
-- **`test-server/`** — Node.js braid-text server for development and
+- **`test/`** — Node.js braid-text server for development and
   testing.

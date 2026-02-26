@@ -25,10 +25,10 @@
 ;; Capture the directory of this file at load time so we can find the server.
 (defconst braid-demo--dir
   (file-name-directory (or load-file-name buffer-file-name default-directory))
-  "Directory containing braid-demo.el and test-server/.")
+  "Directory containing braid-demo.el and test/.")
 
 (defvar braid-demo--server-proc nil
-  "The test-server Node process started by the demo, if any.")
+  "The test server Node process started by the demo, if any.")
 
 (defvar braid-demo--words
   '("hello" "world" "foo" "bar" "baz" "hi" "cat" "dog" "one" "two")
@@ -47,7 +47,7 @@
   "Start the local test server as a child process with output suppressed.
 If the server is already running (port 8888 in use), the new process
 will exit immediately and silently — the existing server handles traffic."
-  (let ((script (expand-file-name "test-server/test-server.js" braid-demo--dir)))
+  (let ((script (expand-file-name "test/test-server.js" braid-demo--dir)))
     (when (file-exists-p script)
       (setq braid-demo--server-proc
             (start-process "braid-test-server" nil "node" script))
