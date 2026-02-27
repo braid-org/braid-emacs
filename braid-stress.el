@@ -41,12 +41,13 @@
                            (funcall orig proc data))))))))
 
 (defun braid-stress--edit (bt buf text pos)
-  "Insert TEXT at POS in BUF and flush BT."
+  "Insert TEXT at POS in BUF and flush BT via fast path."
   (with-current-buffer buf
     (let ((inhibit-modification-hooks t))
       (goto-char (+ (point-min) pos))
-      (insert text)))
-  (braid-text-buffer-changed bt))
+      (let ((beg (point)))
+        (insert text)
+        (braid-text-buffer-changed bt beg (point) 0)))))
 
 (defun braid-stress--wait (seconds)
   "Yield for SECONDS, processing timers and network I/O."
@@ -158,9 +159,11 @@ Returns the body as a string, or nil on failure."
                 (let* ((s (random (max 1 (- len-a 2))))
                        (e (min len-a (+ s 1 (random 2)))))
                   (with-current-buffer buf-a
-                    (let ((inhibit-modification-hooks t))
-                      (delete-region (+ (point-min) s) (+ (point-min) e))))
-                  (braid-text-buffer-changed bt-a))
+                    (let ((inhibit-modification-hooks t)
+                          (beg (+ (point-min) s))
+                          (end (+ (point-min) e)))
+                      (delete-region beg end)
+                      (braid-text-buffer-changed bt-a beg beg (- e s)))))
               (braid-stress--edit bt-a buf-a (format "r%d " i)
                                   (random (1+ len-a))))))
         (dotimes (i 20)

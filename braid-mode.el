@@ -133,13 +133,14 @@ to the buffer.  This is expected and not a real conflict."
   (interactive)
   (message "(No no; already saved to network!)"))
 
-(defun braid-mode--after-change (_beg _end _old-len)
+(defun braid-mode--after-change (beg end old-len)
   "Push local buffer edits to the server."
   (when braid-mode--bt
-    (braid-text-buffer-changed braid-mode--bt))
+    (braid-text-buffer-changed braid-mode--bt beg end old-len))
   ;; Re-send local cursor position after any edit (local or remote)
   ;; so remote peers see the updated position.
   (when braid-mode--bc
+    (braid-cursors-changed braid-mode--bc beg end old-len)
     (braid-cursors--force-send braid-mode--bc))
   ;; Always keep the buffer appearing unmodified — whether we sent a change
   ;; or not (handles cases like capitalize-word on already-capitalized text).
@@ -358,6 +359,8 @@ URL is an http:// or https:// URL string."
     (setq braid-mode--ever-connected nil)
     (setq braid-mode--tls-fallback-tried nil)
     (braid-mode 1)
+    ;; Start read-only until first snapshot arrives (braid-text--set-buffer-text clears it)
+    (setq buffer-read-only t)
     (let ((buf (current-buffer)))
       (setq braid-mode--bt (braid-text-open host port path buf
                                             :tls tls

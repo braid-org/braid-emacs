@@ -595,9 +595,9 @@ not during reconnect itself."
           (should (= (braid-text-outstanding-changes bt) 0)))
       (kill-buffer buf))))
 
-(ert-deftest braid-reconnect/resets-outstanding-changes ()
-  "braid-text--reconnect resets outstanding-changes and cancels ACK timer.
-When no offline edits exist, outstanding-changes stays at 0 after reset."
+(ert-deftest braid-reconnect/preserves-outstanding-changes ()
+  "braid-text--reconnect preserves outstanding-changes (unacked PUTs stay in queue).
+The old ACK timer is cancelled, but a new one is started if there are unacked PUTs."
   (let* ((buf (generate-new-buffer " *braid-test*"))
          (sub (make-braid-http-sub
                :host "127.0.0.1" :port 8888 :path "/test"
@@ -606,6 +606,7 @@ When no offline edits exist, outstanding-changes stays at 0 after reset."
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test" :buffer buf
                :outstanding-changes 5
+               :unacked-puts '("req1" "req2" "req3" "req4" "req5")
                :put-ack-timer (run-with-timer 999 nil #'ignore)
                :client-version '("v0")
                :client-state ""
@@ -616,10 +617,12 @@ When no offline edits exist, outstanding-changes stays at 0 after reset."
                   ((symbol-function 'braid-text--put-proc-open)
                    (lambda (_bt) nil)))
           (braid-text--reconnect bt)
-          ;; No offline edits (buffer = client-state = ""), so outstanding-changes
-          ;; was reset to 0 and changed() was a no-op.
-          (should (= (braid-text-outstanding-changes bt) 0))
-          (should (null (braid-text-put-ack-timer bt))))
+          ;; Outstanding-changes preserved — unacked PUTs will be re-sent
+          (should (= (braid-text-outstanding-changes bt) 5))
+          ;; Unacked PUTs preserved in queue
+          (should (= (length (braid-text-unacked-puts bt)) 5))
+          ;; ACK timer restarted (not nil) since outstanding > 0
+          (should (braid-text-put-ack-timer bt)))
       (when (braid-text-put-ack-timer bt)
         (cancel-timer (braid-text-put-ack-timer bt)))
       (kill-buffer buf))))

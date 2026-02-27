@@ -38,7 +38,7 @@
                           ;   may differ from buffer text if local edits are pending
   (char-counter    -1)     ; cumulative char-delta; used to form version IDs
   (put-proc        nil)    ; persistent network process for pipelining PUTs
-  (put-queue       "")     ; raw PUT request bytes queued while put-proc is connecting
+  (unacked-puts    nil)    ; list of raw PUT request byte strings awaiting ACK
   (outstanding-changes    0)      ; number of PUTs sent but not yet acked by server
   (put-ack-timer   nil)    ; one-shot timer: fires if PUTs go unacked too long
   (max-outstanding-changes 10)  ; throttle: stop sending when this many PUTs unacked
@@ -79,11 +79,7 @@ Set to nil to disable heartbeat-based dead connection detection."
            :peer          peer
            :tls           tls
            :on-connect    (lambda ()
-                            ;; Reset outstanding-changes on (re)connect — the old
-                            ;; put-proc's responses will never arrive (D5).
-                            ;; Matches JS: each PUT's error handler decrements
-                            ;; outstanding_changes on connection failure.
-                            (setf (braid-text-outstanding-changes bt) 0)
+                            ;; Cancel stale PUT ACK timer — reconnect resets it
                             (when (braid-text-put-ack-timer bt)
                               (cancel-timer (braid-text-put-ack-timer bt))
                               (setf (braid-text-put-ack-timer bt) nil))
@@ -114,83 +110,118 @@ Set to nil to disable heartbeat-based dead connection detection."
     (setf (braid-text-put-proc bt) (braid-text--put-proc-open bt))
     bt))
 
-(defun braid-text-buffer-changed (bt)
+(defun braid-text-buffer-changed (bt &optional beg end old-len)
   "Diff BT's buffer against its last-known state and PUT a patch if changed.
-Call this from `after-change-functions' whenever the buffer has been locally edited."
-  (braid-text--changed bt))
+Call this from `after-change-functions' whenever the buffer has been locally edited.
+When BEG, END, OLD-LEN are provided (from `after-change-functions'), they are
+converted to 0-indexed change-info and passed to the fast path."
+  (if (and beg end old-len)
+      (let* ((base    (with-current-buffer (braid-text-buffer bt) (point-min)))
+             (start   (- beg base))
+             (end-old (+ start old-len))
+             (content (with-current-buffer (braid-text-buffer bt)
+                        (buffer-substring-no-properties beg end))))
+        (braid-text--changed bt (list start end-old content)))
+    (braid-text--changed bt nil)))
 
-(defun braid-text--changed (bt)
+(defun braid-text--changed (bt &optional change-info)
   "Diff BT's buffer against its last-known state and PUT a patch if changed.
 The PUT is sent immediately on the persistent put-proc connection (pipelined).
 When at max outstanding PUTs and the buffer has changed, sets `throttled' to
 prevent server updates from being applied to a shifted buffer.  When called
 with no pending changes and throttled, clears the throttle and applies any
-buffered server update."
+buffered server update.
+
+CHANGE-INFO, when non-nil, is a list (START END-IN-OLD CONTENT) providing
+the exact edit from `after-change-functions' (0-indexed).  This avoids the
+O(n) buffer copy and diff on the hot path."
   ;; Clear expired mute
   (when (and (braid-text-muted-until bt)
              (>= (float-time) (braid-text-muted-until bt)))
     (setf (braid-text-muted-until bt) nil))
-  (let* ((new-state (braid-text--buffer-text bt))
-         (has-change (not (equal new-state (braid-text-client-state bt))))
-         (at-max (>= (braid-text-outstanding-changes bt)
+  (let* ((at-max (>= (braid-text-outstanding-changes bt)
                      (braid-text-max-outstanding-changes bt)))
          (muted (braid-text-muted-until bt)))  ; non-nil means still muted
-    (cond
-     ;; No local change — if throttled, clear throttle and apply buffered update
-     ((not has-change)
-      (when (braid-text-throttled bt)
-        (setf (braid-text-throttled bt) nil)
-        (let ((update (braid-text-throttled-update bt)))
-          (setf (braid-text-throttled-update bt) nil)
-          (when update
-            (braid-text--on-message bt update)))))
-
-     ;; At max outstanding or muted — mark throttled, don't send
-     ((or at-max muted)
-      (setf (braid-text-throttled bt) t))
-
-     ;; Normal: send the diff
-     (t
-      (let ((prev (braid-text-client-state bt)))
-        (let* ((diff          (braid-text--simple-diff prev new-state))
-               (start         (plist-get diff :start))
-               (end           (plist-get diff :end))
-               (content       (plist-get diff :content))
-               (delta         (+ (- end start) (length content)))
-               (parents       (braid-text-client-version bt)))
-          (cl-incf (braid-text-char-counter bt) delta)
-          (let* ((version       (list (format "%s-%d"
-                                              (braid-text-peer bt)
-                                              (braid-text-char-counter bt))))
-                 (content-bytes (encode-coding-string content 'utf-8))
-                 (body-headers  `(("Content-Type"   . ,(braid-text-content-type bt))
-                                   ("Merge-Type"     . "simpleton")
-                                   ("Content-Length" . ,(number-to-string (length content-bytes)))
-                                   ("Content-Range"  . ,(format "text [%d:%d]" start end))
-                                   ("Peer"           . ,(braid-text-peer bt))))
-                 (request       (braid-http--format-put
-                                  (braid-text-host bt) (braid-text-port bt) (braid-text-path bt)
-                                  version parents body-headers content-bytes))
-                 (proc          (braid-text-put-proc bt)))
-            (setf (braid-text-client-version bt) version)
-            (setf (braid-text-client-state bt) new-state)
-            ;; Start PUT ACK timer when transitioning 0 → >0
-            (when (and (= (braid-text-outstanding-changes bt) 0)
-                       (not (braid-text-put-ack-timer bt)))
-              (setf (braid-text-put-ack-timer bt)
-                    (run-with-timer
-                     braid-text-put-ack-timeout nil
-                     (lambda ()
-                       (when (> (braid-text-outstanding-changes bt) 0)
-                         (braid-text--connection-dead bt))))))
-            (cl-incf (braid-text-outstanding-changes bt))
+    ;; Fast path: hook gave us the exact edit, and we can send immediately
+    (if (and change-info (not at-max) (not muted)
+             (not (braid-text-throttled bt)))
+        (let ((start      (nth 0 change-info))
+              (end-in-old (nth 1 change-info))
+              (content    (nth 2 change-info)))
+          ;; Skip no-op edits (e.g. empty insert at a position)
+          (unless (and (= start end-in-old) (string-empty-p content))
+            (let ((new-state (concat (substring (braid-text-client-state bt) 0 start)
+                                     content
+                                     (substring (braid-text-client-state bt) end-in-old))))
+              (braid-text--send-patch bt new-state start end-in-old content))))
+      ;; Slow path: full buffer copy + diff
+      (let* ((new-state (braid-text--buffer-text bt))
+             (has-change (not (equal new-state (braid-text-client-state bt)))))
+        (cond
+         ;; No local change — if throttled, clear throttle and apply buffered update
+         ((not has-change)
+          (when (braid-text-throttled bt)
             (setf (braid-text-throttled bt) nil)
-            (if (and proc (process-live-p proc))
-                (process-send-string proc request)
-              ;; put-proc is dead — queue the request and reconnect if needed
-              (setf (braid-text-put-queue bt)
-                    (concat (braid-text-put-queue bt) request))
-              (when proc (braid-text--put-proc-reconnect bt))))))))))
+            (let ((update (braid-text-throttled-update bt)))
+              (setf (braid-text-throttled-update bt) nil)
+              (when update
+                (braid-text--on-message bt update)))))
+
+         ;; At max outstanding or muted — mark throttled, don't send
+         ((or at-max muted)
+          (setf (braid-text-throttled bt) t))
+
+         ;; Normal: send the diff
+         (t
+          (let* ((prev    (braid-text-client-state bt))
+                 (diff    (braid-text--simple-diff prev new-state))
+                 (start   (plist-get diff :start))
+                 (end     (plist-get diff :end))
+                 (content (plist-get diff :content)))
+            (braid-text--send-patch bt new-state start end content))))))))
+
+(defun braid-text--send-patch (bt new-state start end content)
+  "Build and send a PUT patch for BT.
+NEW-STATE is the post-edit buffer text (becomes new client-state).
+START/END are 0-indexed char offsets into client-state; CONTENT replaces [START,END)."
+  (let* ((delta         (+ (- end start) (length content)))
+         (parents       (braid-text-client-version bt)))
+    (cl-incf (braid-text-char-counter bt) delta)
+    (let* ((version       (list (format "%s-%d"
+                                        (braid-text-peer bt)
+                                        (braid-text-char-counter bt))))
+           (content-bytes (encode-coding-string content 'utf-8))
+           (body-headers  `(("Content-Type"   . ,(braid-text-content-type bt))
+                             ("Merge-Type"     . "simpleton")
+                             ("Content-Length" . ,(number-to-string (length content-bytes)))
+                             ("Content-Range"  . ,(format "text [%d:%d]" start end))
+                             ("Peer"           . ,(braid-text-peer bt))))
+           (request       (braid-http--format-put
+                            (braid-text-host bt) (braid-text-port bt) (braid-text-path bt)
+                            version parents body-headers content-bytes))
+           (proc          (braid-text-put-proc bt)))
+      (setf (braid-text-client-version bt) version)
+      (setf (braid-text-client-state bt) new-state)
+      ;; Start PUT ACK timer when transitioning 0 → >0
+      (when (and (= (braid-text-outstanding-changes bt) 0)
+                 (not (braid-text-put-ack-timer bt)))
+        (setf (braid-text-put-ack-timer bt)
+              (run-with-timer
+               braid-text-put-ack-timeout nil
+               (lambda ()
+                 (when (> (braid-text-outstanding-changes bt) 0)
+                   (braid-text--connection-dead bt))))))
+      (cl-incf (braid-text-outstanding-changes bt))
+      (setf (braid-text-throttled bt) nil)
+      ;; Always append to unacked queue; pop only on ACK
+      (setf (braid-text-unacked-puts bt)
+            (append (braid-text-unacked-puts bt) (list request)))
+      ;; Send immediately if socket is fully connected
+      (when (and proc (eq (process-status proc) 'open))
+        (process-send-string proc request))
+      ;; If proc is dead, reconnect (sentinel will re-send queue)
+      (when (and proc (not (process-live-p proc)))
+        (braid-text--put-proc-reconnect bt)))))
 
 (defun braid-text-close (bt)
   "Close BT's PUT connection and subscription, stopping all syncing."
@@ -199,8 +230,8 @@ buffered server update."
     (setf (braid-text-put-ack-timer bt) nil))
   (when-let ((p (braid-text-put-proc bt)))
     (when (process-live-p p) (delete-process p)))
-  (setf (braid-text-put-proc  bt) nil)
-  (setf (braid-text-put-queue bt) "")
+  (setf (braid-text-put-proc    bt) nil)
+  (setf (braid-text-unacked-puts bt) nil)
   (braid-http-unsubscribe (braid-text-sub bt)))
 
 (defun braid-text--reconnect (bt)
@@ -209,8 +240,7 @@ Closes the old subscription and opens a fresh one with Parents set to
 `client-version' (via parents-fn).  Local buffer edits are preserved
 because the server will send patches from our version, not a full snapshot."
   (message "Braid: reconnecting")
-  ;; Reset outstanding-changes counter for throttling — retried PUTs will re-increment it
-  (setf (braid-text-outstanding-changes bt) 0)
+  ;; Cancel stale PUT ACK timer — reconnect resets it
   (when (braid-text-put-ack-timer bt)
     (cancel-timer (braid-text-put-ack-timer bt))
     (setf (braid-text-put-ack-timer bt) nil))
@@ -226,7 +256,7 @@ because the server will send patches from our version, not a full snapshot."
     (when-let ((p (braid-text-put-proc bt)))
       (when (process-live-p p) (delete-process p)))
     (braid-text--put-proc-reconnect bt)
-    ;; Open a new subscription — on-connect resets outstanding-changes
+    ;; Open a new subscription
     (let ((new-sub (braid-http-subscribe (braid-text-host bt)
                                     (braid-text-port bt)
                                     (braid-text-path bt)
@@ -298,38 +328,45 @@ socket that we write PUT request bytes onto directly."
          (setq matched t)
          (let ((code (string-to-number (match-string 1 data))))
            (cl-decf (braid-text-outstanding-changes bt))
-           (cond
-            ;; 550: permanent rejection — fatal, stop syncing
-            ((= code 550)
-             (braid-text--fatal-error bt (format "PUT permanently rejected (HTTP 550)")))
-            ;; 309: Version Unknown — server needs us to retry after it
-            ;; learns about our parents (e.g., from a queued earlier PUT).
-            ((= code 309)
-             (message "Braid: version unknown (309) — retrying in 1s")
-             (run-with-timer 1.0 nil (lambda () (braid-text--changed bt))))
-            ;; 503: server overloaded — enter mute mode
-            ((= code 503)
-             (message "Braid: server busy (503) — backing off for 3s")
-             (setf (braid-text-muted-until bt) (+ (float-time) 3.0))
-             (run-with-timer 3.0 nil (lambda () (braid-text--changed bt))))
-            ;; Success — send throttled edits
-            ((and (>= code 200) (< code 300))
-             (setq should-send t))
-            ;; 401/403: not authorized — undo the local edit and go read-only
-            ((memq code '(401 403))
-             (braid-text--not-authorized bt code))
-            ;; 408: idle connection timeout (Node.js closes idle keep-alive
-            ;; connections).  Not an error — just means we need to reopen the
-            ;; pipelining connection on next PUT.  No retry needed.
-            ((= code 408) nil)
-            ;; Transient errors — retry via delayed changed()
-            ((memq code '(429 500 502 504))
-             (message "Braid: PUT error (HTTP %d) — retrying in 1s" code)
-             (run-with-timer 1.0 nil (lambda () (braid-text--changed bt))))
-            ;; Other errors — log and call changed() (don't silently lose the edit)
-            (t
-             (message "Braid: PUT rejected (HTTP %d)" code)
-             (setq should-send t)))))
+           (let ((popped (pop (braid-text-unacked-puts bt))))
+             (cond
+              ;; 550: permanent rejection — fatal, stop syncing
+              ((= code 550)
+               (braid-text--fatal-error bt (format "PUT permanently rejected (HTTP 550)")))
+              ;; 309: Version Unknown — re-queue and retry the same PUT bytes
+              ((= code 309)
+               (cl-incf (braid-text-outstanding-changes bt))
+               (setf (braid-text-unacked-puts bt)
+                     (append (braid-text-unacked-puts bt) (list popped)))
+               (message "Braid: version unknown (309) — retrying in 1s")
+               (run-with-timer 1.0 nil
+                 (lambda ()
+                   (let ((proc (braid-text-put-proc bt)))
+                     (when (and proc (eq (process-status proc) 'open))
+                       (process-send-string proc popped))))))
+              ;; 503: server overloaded — enter mute mode
+              ((= code 503)
+               (message "Braid: server busy (503) — backing off for 3s")
+               (setf (braid-text-muted-until bt) (+ (float-time) 3.0))
+               (run-with-timer 3.0 nil (lambda () (braid-text--changed bt))))
+              ;; Success — send throttled edits
+              ((and (>= code 200) (< code 300))
+               (setq should-send t))
+              ;; 401/403: not authorized — undo the local edit and go read-only
+              ((memq code '(401 403))
+               (braid-text--not-authorized bt code))
+              ;; 408: idle connection timeout (Node.js closes idle keep-alive
+              ;; connections).  Not an error — just means we need to reopen the
+              ;; pipelining connection on next PUT.  No retry needed.
+              ((= code 408) nil)
+              ;; Transient errors — retry via delayed changed()
+              ((memq code '(429 500 502 504))
+               (message "Braid: PUT error (HTTP %d) — retrying in 1s" code)
+               (run-with-timer 1.0 nil (lambda () (braid-text--changed bt))))
+              ;; Other errors — log and call changed() (don't silently lose the edit)
+              (t
+               (message "Braid: PUT rejected (HTTP %d)" code)
+               (setq should-send t))))))
        (when matched
          (when (< (braid-text-outstanding-changes bt) 0)
            (setf (braid-text-outstanding-changes bt) 0))
@@ -346,29 +383,38 @@ socket that we write PUT request bytes onto directly."
    (lambda (proc event)
      (cond
       ((string-prefix-p "open" event)
-       (let ((queued (braid-text-put-queue bt)))
-         (setf (braid-text-put-queue bt) "")
-         (unless (string-empty-p queued)
-           (process-send-string proc queued))))
+       (dolist (req (braid-text-unacked-puts bt))
+         (process-send-string proc req)))
       ((or (string-prefix-p "finished" event)
            (string-prefix-p "deleted"  event))
        nil)  ; closed intentionally
       (t
-       ;; Unexpected disconnect — reconnect after a brief pause.
+       ;; Unexpected disconnect — restart PUT ACK timer for re-sent PUTs
+       (when (braid-text-put-ack-timer bt)
+         (cancel-timer (braid-text-put-ack-timer bt)))
+       (when (> (braid-text-outstanding-changes bt) 0)
+         (setf (braid-text-put-ack-timer bt)
+               (run-with-timer braid-text-put-ack-timeout nil
+                 (lambda () (when (> (braid-text-outstanding-changes bt) 0)
+                              (braid-text--connection-dead bt))))))
+       ;; Reconnect after a brief pause
        (run-with-timer 1.0 nil #'braid-text--put-proc-reconnect bt))))
    'nowait))
 
 (defun braid-text--put-proc-reconnect (bt)
   "Reconnect BT's put-proc after a disconnect.
-Resets outstanding-changes to 0 because in-flight PUTs on the dead connection
-will never be acked (mirrors JS where each failed fetch decrements
-outstanding_changes).  Queued PUTs are preserved — their version chains
-are valid because client-version is never reset on reconnect."
-  ;; Reset outstanding-changes — old connection's ACKs will never arrive (D5)
-  (setf (braid-text-outstanding-changes bt) 0)
+Unacked PUTs are preserved in the queue — the sentinel will re-send them
+when the new socket opens.  Outstanding-changes count is NOT reset because
+the unacked PUTs are still in flight (just on a new socket)."
+  ;; Cancel stale PUT ACK timer; restart if unacked PUTs remain
   (when (braid-text-put-ack-timer bt)
     (cancel-timer (braid-text-put-ack-timer bt))
     (setf (braid-text-put-ack-timer bt) nil))
+  (when (> (braid-text-outstanding-changes bt) 0)
+    (setf (braid-text-put-ack-timer bt)
+          (run-with-timer braid-text-put-ack-timeout nil
+            (lambda () (when (> (braid-text-outstanding-changes bt) 0)
+                         (braid-text--connection-dead bt))))))
   (condition-case err
       (setf (braid-text-put-proc bt) (braid-text--put-proc-open bt))
     (error
@@ -513,13 +559,17 @@ by THUNK via `braid-text--adjust-point') are written back."
         (set-window-point (car ws) (+ new-base (cdr ws)))))))
 
 (defun braid-text--set-buffer-text (bt text)
-  "Replace BT's buffer content with TEXT, suppressing change hooks."
-  (let ((buf (braid-text-buffer bt)))
+  "Replace BT's buffer content with TEXT, suppressing change hooks.
+On first load (client-version nil), clears the undo list and makes the
+buffer editable (it starts read-only until the first snapshot arrives)."
+  (let ((buf (braid-text-buffer bt))
+        (first-load (null (braid-text-client-version bt))))
     (braid-text--with-saved-points
      buf
      (lambda (saved)
        (with-current-buffer buf
          (let* ((new-len             (length text))
+                (buffer-undo-list    t) ; suppress undo recording
                 (inhibit-modification-hooks t)
                 (inhibit-read-only t))
            (erase-buffer)
@@ -530,7 +580,12 @@ by THUNK via `braid-text--adjust-point') are written back."
            (mapcar (lambda (ws)
                      (cons (car ws) (min (cdr ws) new-len)))
                    saved)))))
-    (setf (braid-text-client-state bt) text)))
+    (setf (braid-text-client-state bt) text)
+    ;; On first load: clear undo list and make buffer editable
+    (when first-load
+      (with-current-buffer buf
+        (setq buffer-undo-list nil)
+        (setq buffer-read-only nil)))))
 
 (defun braid-text--adjust-point-absolute (pos patches)
   "Adjust 0-indexed char offset POS for absolute-coordinate PATCHES.
