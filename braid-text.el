@@ -47,6 +47,7 @@
   (content-type    "text/plain") ; content-type from server, used in PUTs
   (throttled       nil)    ; t when buffer is ahead of client-state and we can't send
   (throttled-update nil)   ; buffered server update to apply when throttle clears
+  (on-edit         nil)    ; callback called with patches list after any edit (local or remote)
   sub)                     ; braid-http-sub handle
 
 
@@ -55,7 +56,7 @@
 ;;;; ======================================================================
 
 (cl-defun braid-text-open (host port path buffer
-                          &key tls on-connect on-disconnect
+                          &key tls on-connect on-disconnect on-edit
                           (heartbeat-interval 30))
   "Subscribe BUFFER to the braid-text resource at HOST:PORT/PATH.
 Uses the simpleton merge type.  Returns a braid-text struct.
@@ -64,6 +65,9 @@ is locally edited, and to `braid-text-close' to disconnect.
 
 ON-CONNECT and ON-DISCONNECT are optional callbacks forwarded to
 `braid-http-subscribe'.
+ON-EDIT, when non-nil, is called with a list of patches after any edit
+\(local or remote).  Each patch is (:start S :end E :content C) with
+0-indexed absolute coordinates relative to the pre-edit state.
 HEARTBEAT-INTERVAL (default 30) requests server heartbeats every N seconds.
 Set to nil to disable heartbeat-based dead connection detection."
   (let* ((peer (format "emacs%04x%04x" (random #xffff) (random #xffff)))
@@ -72,7 +76,8 @@ Set to nil to disable heartbeat-based dead connection detection."
                                 :path   path
                                 :peer   peer
                                 :buffer buffer
-                                :tls    tls)))
+                                :tls    tls
+                                :on-edit on-edit)))
     (setf (braid-text-sub bt)
           (braid-http-subscribe
            host port path
@@ -122,6 +127,11 @@ converted to 0-indexed change-info and passed to the fast path."
              (end-old (+ start old-len))
              (content (with-current-buffer (braid-text-buffer bt)
                         (buffer-substring-no-properties beg end))))
+        ;; Fire on-edit for every local change (even if throttled)
+        (unless (and (= start end-old) (string-empty-p content))
+          (when (braid-text-on-edit bt)
+            (funcall (braid-text-on-edit bt)
+                     (list (list :start start :end end-old :content content)))))
         (braid-text--changed bt (list start end-old content)))
     (braid-text--changed bt nil)))
 
@@ -677,7 +687,15 @@ for shifts from preceding patches."
            (when buffer-file-name (set-visited-file-modtime)))
          result)))
     (setf (braid-text-client-state bt)
-          (braid-text--buffer-text bt))))
+          (braid-text--buffer-text bt))
+    ;; Fire on-edit for remote changes
+    (when (and patches (braid-text-on-edit bt))
+      (funcall (braid-text-on-edit bt)
+               (mapcar (lambda (p)
+                         (let ((cr (plist-get p :content-range)))
+                           (list :start (nth 1 cr) :end (nth 2 cr)
+                                 :content (or (plist-get p :body) ""))))
+                       patches)))))
 
 
 ;;;; ======================================================================

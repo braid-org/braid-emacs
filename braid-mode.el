@@ -137,11 +137,8 @@ to the buffer.  This is expected and not a real conflict."
   "Push local buffer edits to the server."
   (when braid-mode--bt
     (braid-text-buffer-changed braid-mode--bt beg end old-len))
-  ;; Re-send local cursor position after any edit (local or remote)
-  ;; so remote peers see the updated position.
-  (when braid-mode--bc
-    (braid-cursors-changed braid-mode--bc beg end old-len)
-    (braid-cursors--force-send braid-mode--bc))
+  ;; Cursor transforms are handled by the :on-edit hook in braid-text,
+  ;; which fires for both local and remote edits.
   ;; Always keep the buffer appearing unmodified — whether we sent a change
   ;; or not (handles cases like capitalize-word on already-capitalized text).
   (set-buffer-modified-p nil)
@@ -341,7 +338,13 @@ rather than a server that is simply not running."
                                                    :on-disconnect
                                                    (lambda ()
                                                      (with-current-buffer buf
-                                                       (braid-mode--on-disconnect)))))
+                                                       (braid-mode--on-disconnect)))
+                                                   :on-edit
+                                                   (lambda (patches)
+                                                     (when (buffer-live-p buf)
+                                                       (with-current-buffer buf
+                                                         (when braid-mode--bc
+                                                           (braid-cursors-on-edit braid-mode--bc patches)))))))
                             (setq braid-mode--bc (braid-cursors-open braid-mode--bt)))))))))
 
 (defun braid-connect (url)
@@ -371,7 +374,13 @@ URL is an http:// or https:// URL string."
                                             :on-disconnect
                                             (lambda ()
                                               (with-current-buffer buf
-                                                (braid-mode--on-disconnect)))))
+                                                (braid-mode--on-disconnect)))
+                                            :on-edit
+                                            (lambda (patches)
+                                              (when (buffer-live-p buf)
+                                                (with-current-buffer buf
+                                                  (when braid-mode--bc
+                                                    (braid-cursors-on-edit braid-mode--bc patches)))))))
       ;; Start cursor sharing
       (setq braid-mode--bc (braid-cursors-open braid-mode--bt))
       ;; Set initial reconnect cap based on whether this buffer is focused.

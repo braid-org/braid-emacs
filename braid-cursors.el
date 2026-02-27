@@ -221,28 +221,37 @@ Returns a `braid-cursor' struct, or nil if the server does not support cursors."
    ((<= pos (+ del-start del-len)) (+ del-start ins-len))
    (t (+ pos (- ins-len del-len)))))
 
-(defun braid-cursors-changed (bc beg end old-len)
-  "Transform all stored remote cursor positions through a buffer edit.
-BEG and END are buffer positions (1-indexed) after the change.
-OLD-LEN is the length of the deleted text.
-Call this from `after-change-functions'."
+(defun braid-cursors-on-edit (bc patches)
+  "Transform stored remote cursor positions through PATCHES and re-render.
+PATCHES is a list of (:start S :end E :content C) with 0-indexed absolute
+coordinates (all relative to the pre-edit state).  Called from the braid-text
+:on-edit hook for both local and remote edits."
   (when (and bc (braid-cursor-remote bc))
-    (let ((del-start (1- beg))
-          (del-len old-len)
-          (ins-len (- end beg))
-          (buf (braid-text-buffer (braid-cursor-bt bc))))
+    (let ((buf (braid-text-buffer (braid-cursor-bt bc))))
       (when (buffer-live-p buf)
-        (maphash
-         (lambda (_peer-id entry)
-           (plist-put entry :selections
-                      (mapcar (lambda (sel)
-                                (cons (braid-cursors--transform-pos
-                                       (car sel) del-start del-len ins-len)
-                                      (braid-cursors--transform-pos
-                                       (cdr sel) del-start del-len ins-len)))
-                              (plist-get entry :selections))))
-         (braid-cursor-remote bc))
-        (braid-cursors--render bc)))))
+        ;; Transform each stored position through all patches.
+        ;; Patches use absolute coordinates, so we track cumulative offset.
+        (let ((cum-delta 0))
+          (dolist (patch patches)
+            (let* ((start (plist-get patch :start))
+                   (end (plist-get patch :end))
+                   (ins-len (length (plist-get patch :content)))
+                   (del-start (+ start cum-delta))
+                   (del-len (- end start)))
+              (maphash
+               (lambda (_peer-id entry)
+                 (plist-put entry :selections
+                            (mapcar (lambda (sel)
+                                      (cons (braid-cursors--transform-pos
+                                             (car sel) del-start del-len ins-len)
+                                            (braid-cursors--transform-pos
+                                             (cdr sel) del-start del-len ins-len)))
+                                    (plist-get entry :selections))))
+               (braid-cursor-remote bc))
+              (cl-incf cum-delta (- ins-len del-len)))))
+        (braid-cursors--render bc)
+        ;; Invalidate last-sent so post-command-hook re-sends our shifted position
+        (setf (braid-cursor-last-sent bc) nil)))))
 
 
 ;;;; ======================================================================
