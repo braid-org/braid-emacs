@@ -665,5 +665,51 @@ Returns the (short-lived) network process."
     proc))
 
 
+(defun braid-http--format-put-patches (host port path version parents
+                                      patches content-type peer)
+  "Format a multi-patch PUT request using the Patches: N wire format.
+PATCHES is a list of (:start S :end E :content C) plists.
+For a single patch, uses inline Content-Range (no Patches: header).
+Returns the raw request bytes as a unibyte string."
+  (if (= (length patches) 1)
+      ;; Single patch: inline Content-Range format (backwards compat)
+      (let* ((p (car patches))
+             (start (plist-get p :start))
+             (end   (plist-get p :end))
+             (content (or (plist-get p :content) ""))
+             (content-bytes (encode-coding-string content 'utf-8))
+             (body-headers `(("Content-Type"   . ,(or content-type "text/plain"))
+                              ("Merge-Type"     . "simpleton")
+                              ("Content-Length" . ,(number-to-string (length content-bytes)))
+                              ("Content-Range"  . ,(format "text [%d:%d]" start end))
+                              ,@(when peer `(("Peer" . ,peer))))))
+        (braid-http--format-put host port path version parents
+                                body-headers content-bytes))
+    ;; Multi-patch: Patches: N wire format
+    (let* ((body
+            (let ((parts nil)
+                  (first t))
+              (dolist (p patches)
+                (let* ((start (plist-get p :start))
+                       (end   (plist-get p :end))
+                       (content (or (plist-get p :content) ""))
+                       (content-bytes (encode-coding-string content 'utf-8)))
+                  (unless first (push "\r\n" parts))
+                  (setq first nil)
+                  (push (format "content-length: %d\r\n" (length content-bytes)) parts)
+                  (push (format "content-range: text [%d:%d]\r\n" start end) parts)
+                  (push "\r\n" parts)
+                  (push content-bytes parts)
+                  (push "\r\n" parts)))
+              (apply #'concat (nreverse parts))))
+           (body-headers `(("Content-Type"   . ,(or content-type "text/plain"))
+                            ("Merge-Type"     . "simpleton")
+                            ("Patches"        . ,(number-to-string (length patches)))
+                            ("Content-Length" . ,(number-to-string (length body)))
+                            ,@(when peer `(("Peer" . ,peer))))))
+      (braid-http--format-put host port path version parents
+                              body-headers body))))
+
+
 (provide 'braid-http)
 ;;; braid-http.el ends here

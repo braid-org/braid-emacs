@@ -17,6 +17,7 @@
 
 (require 'cl-lib)
 (require 'braid-http)
+(require 'myers-diff)
 
 (defvar braid-text-debug nil
   "When non-nil, log buffer state before/after each applied update.")
@@ -171,35 +172,32 @@ O(n) buffer copy and diff on the hot path."
          ((or at-max muted)
           (setf (braid-text-throttled bt) t))
 
-         ;; Normal: send the diff
+         ;; Normal: send the diff (Myers for multi-patch)
          (t
-          (let* ((prev    (braid-text-client-state bt))
-                 (diff    (braid-text--simple-diff prev new-state))
-                 (start   (plist-get diff :start))
-                 (end     (plist-get diff :end))
-                 (content (plist-get diff :content)))
-            (braid-text--send-patch bt new-state start end content))))))))
+          (let ((patches (myers-diff-patches
+                          (braid-text-client-state bt) new-state)))
+            (when patches
+              (braid-text--send-patches bt new-state patches)))))))))
 
-(defun braid-text--send-patch (bt new-state start end content)
-  "Build and send a PUT patch for BT.
+(defun braid-text--send-patches (bt new-state patches)
+  "Build and send a PUT with one or more PATCHES for BT.
 NEW-STATE is the post-edit buffer text (becomes new client-state).
-START/END are 0-indexed char offsets into client-state; CONTENT replaces [START,END)."
-  (let* ((delta         (+ (- end start) (length content)))
-         (parents       (braid-text-client-version bt)))
+PATCHES is a list of (:start S :end E :content C).
+Single-patch PUTs use inline Content-Range; multi-patch use Patches: N."
+  (let* ((delta (cl-reduce #'+ patches
+                           :key (lambda (p)
+                                  (+ (- (plist-get p :end) (plist-get p :start))
+                                     (length (plist-get p :content))))))
+         (parents (braid-text-client-version bt)))
     (cl-incf (braid-text-char-counter bt) delta)
-    (let* ((version       (list (format "%s-%d"
-                                        (braid-text-peer bt)
-                                        (braid-text-char-counter bt))))
-           (content-bytes (encode-coding-string content 'utf-8))
-           (body-headers  `(("Content-Type"   . ,(braid-text-content-type bt))
-                             ("Merge-Type"     . "simpleton")
-                             ("Content-Length" . ,(number-to-string (length content-bytes)))
-                             ("Content-Range"  . ,(format "text [%d:%d]" start end))
-                             ("Peer"           . ,(braid-text-peer bt))))
-           (request       (braid-http--format-put
-                            (braid-text-host bt) (braid-text-port bt) (braid-text-path bt)
-                            version parents body-headers content-bytes))
-           (proc          (braid-text-put-proc bt)))
+    (let* ((version (list (format "%s-%d"
+                                  (braid-text-peer bt)
+                                  (braid-text-char-counter bt))))
+           (request (braid-http--format-put-patches
+                     (braid-text-host bt) (braid-text-port bt) (braid-text-path bt)
+                     version parents patches
+                     (braid-text-content-type bt) (braid-text-peer bt)))
+           (proc    (braid-text-put-proc bt)))
       (setf (braid-text-client-version bt) version)
       (setf (braid-text-client-state bt) new-state)
       ;; Start PUT ACK timer when transitioning 0 → >0
@@ -222,6 +220,12 @@ START/END are 0-indexed char offsets into client-state; CONTENT replaces [START,
       ;; If proc is dead, reconnect (sentinel will re-send queue)
       (when (and proc (not (process-live-p proc)))
         (braid-text--put-proc-reconnect bt)))))
+
+(defun braid-text--send-patch (bt new-state start end content)
+  "Build and send a single-patch PUT for BT.
+Thin wrapper around `braid-text--send-patches'."
+  (braid-text--send-patches bt new-state
+                            (list (list :start start :end end :content content))))
 
 (defun braid-text-close (bt)
   "Close BT's PUT connection and subscription, stopping all syncing."
