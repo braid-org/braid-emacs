@@ -117,10 +117,11 @@ Set to nil to disable heartbeat-based dead connection detection."
     bt))
 
 (defun braid-text-buffer-changed (bt &optional beg end old-len)
-  "Diff BT's buffer against its last-known state and PUT a patch if changed.
-Call this from `after-change-functions' whenever the buffer has been locally edited.
-When BEG, END, OLD-LEN are provided (from `after-change-functions'), they are
-converted to 0-indexed change-info and passed to the fast path."
+  "Diff BT's buffer against its last-known state and PUT a patch.
+Call this from `after-change-functions' whenever the buffer has
+been locally edited.  When BEG, END, OLD-LEN are provided (from
+`after-change-functions'), they are converted to 0-indexed
+change-info and passed to the fast path."
   (if (and beg end old-len)
       (let* ((base    (with-current-buffer (braid-text-buffer bt) (point-min)))
              (start   (- beg base))
@@ -429,11 +430,9 @@ the unacked PUTs are still in flight (just on a new socket)."
           (run-with-timer braid-text-put-ack-timeout nil
             (lambda () (when (> (braid-text-outstanding-changes bt) 0)
                          (braid-text--connection-dead bt))))))
-  (condition-case err
+  (condition-case _err
       (setf (braid-text-put-proc bt) (braid-text--put-proc-open bt))
     (error
-     (message "Braid: put-proc reconnect failed (%s) — retrying in 3s"
-              (error-message-string err))
      (run-with-timer 3.0 nil #'braid-text--put-proc-reconnect bt))))
 
 (defun braid-text--connection-dead (bt)
@@ -546,10 +545,10 @@ from that version, or wait for a retry PUT to establish the version."
     (buffer-substring-no-properties (point-min) (point-max))))
 
 (defun braid-text--adjust-point (pos start end new-len)
-  "Adjust 0-indexed char offset POS for a patch replacing [START,END) with NEW-LEN chars.
-If POS is after the region it shifts by the net delta.
-If POS is inside the region it is clamped to START.
-If POS is at or before START it is unchanged."
+  "Adjust 0-indexed offset POS for a patch replacing [START,END).
+NEW-LEN is the replacement length.  If POS is after the region it
+shifts by the net delta.  If POS is inside the region it is
+clamped to START.  If POS is at or before START it is unchanged."
   (cond
    ((>= pos end)  (+ pos (- new-len (- end start))))
    ((> pos start) start)

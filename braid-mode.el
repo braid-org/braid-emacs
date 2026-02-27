@@ -17,6 +17,10 @@
 
 (require 'braid-text)
 (require 'braid-cursors)
+(eval-when-compile (require 'url-parse))
+
+;; Forward-declare the minor-mode variable (defined by define-minor-mode below)
+(defvar braid-mode)
 
 
 ;;;; ======================================================================
@@ -28,12 +32,12 @@
   :group 'communication)
 
 (defcustom braid-reconnect-max-delay-foreground 3.0
-  "Max reconnect backoff (seconds) for braid buffers displayed in the selected window."
+  "Max reconnect backoff for foreground braid buffers, in seconds."
   :type 'number
   :group 'braid)
 
 (defcustom braid-reconnect-max-delay-background 120.0
-  "Max reconnect backoff (seconds) for braid buffers not displayed in the selected window."
+  "Max reconnect backoff for background braid buffers, in seconds."
   :type 'number
   :group 'braid)
 
@@ -404,18 +408,27 @@ URL is an http:// or https:// URL string."
   "Handle file operations on http:// and https:// URLs."
   (pcase operation
     ('expand-file-name
-     (if (string-match-p "\\`https?://" (car args))
-         (car args)
-       ;; Non-URL relative path with a URL default-directory —
-       ;; expand against home instead of the URL.
-       (let ((inhibit-file-name-handlers
-              (cons 'braid-mode--file-handler inhibit-file-name-handlers))
-             (inhibit-file-name-operation 'expand-file-name))
-         (expand-file-name (car args)
-                           (if (and (nth 1 args)
-                                    (string-match-p "\\`https?://" (nth 1 args)))
-                               "~/"
-                             (nth 1 args))))))
+     (let ((name (car args))
+           (dir (nth 1 args)))
+       (cond
+        ;; URL name — return as-is
+        ((string-match-p "\\`https?://" name) name)
+        ;; Absolute local path with URL dir — expand normally, ignore URL
+        ((and dir (string-match-p "\\`https?://" dir)
+              (or (string-prefix-p "/" name) (string-prefix-p "~" name)))
+         (let ((inhibit-file-name-handlers
+                (cons 'braid-mode--file-handler inhibit-file-name-handlers))
+               (inhibit-file-name-operation 'expand-file-name))
+           (expand-file-name name)))
+        ;; Relative path with URL dir — expand against URL directory
+        ((and dir (string-match-p "\\`https?://" dir))
+         (concat (file-name-as-directory dir) name))
+        ;; Non-URL dir — normal expansion
+        (t
+         (let ((inhibit-file-name-handlers
+                (cons 'braid-mode--file-handler inhibit-file-name-handlers))
+               (inhibit-file-name-operation 'expand-file-name))
+           (expand-file-name name dir))))))
     ('file-truename (car args))
     ('file-name-directory
      (let ((url (car args)))

@@ -375,7 +375,7 @@ Returns t if parsed, nil if more data needed."
              (cl-str  (cdr (assoc "content-length" headers)))
              (cr-str  (cdr (assoc "content-range"  headers)))
              (cl      (if cl-str (string-to-number cl-str) 0)))
-        (when braid-text-debug
+        (when (bound-and-true-p braid-text-debug)
           (message "Braid: patch-n-headers block=%S headers=%S cr-str=%S cl=%d"
                    block headers cr-str cl))
         (setf (braid-http-sub-cur-cl       sub) cl)
@@ -524,13 +524,11 @@ the SENTINEL will be called with an \"open\" event when ready."
            delay nil
            (lambda ()
              (when (not (eq (braid-http-sub-status sub) :closed))
-               (condition-case err
+               (condition-case _err
                    (braid-http--open sub (if (braid-http-sub-parents-fn sub)
                                              (funcall (braid-http-sub-parents-fn sub))
                                            (braid-http-sub-last-parents sub)))
                  (error
-                  (message "Braid: reconnect failed (%s) — retrying"
-                           (error-message-string err))
                   (braid-http--schedule-reconnect sub)))))))))
 
 (defun braid-http-expedite-reconnect (sub)

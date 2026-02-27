@@ -200,11 +200,9 @@ Returns a `braid-cursor' struct, or nil if the server does not support cursors."
 
 (defun braid-cursors--put-proc-reconnect (bc)
   "Reconnect BC's put-proc."
-  (condition-case err
+  (condition-case _err
       (setf (braid-cursor-put-proc bc) (braid-cursors--put-proc-open bc))
     (error
-     (message "Braid: cursor put-proc reconnect failed (%s) — retrying in 3s"
-              (error-message-string err))
      (run-with-timer 3.0 nil #'braid-cursors--put-proc-reconnect bc))))
 
 
@@ -318,8 +316,9 @@ coordinates (all relative to the pre-edit state).  Called from the braid-text
          (message "Braid: cursor update error: %S" err))))))
 
 (defun braid-cursors--parse-selections (selections buf)
-  "Parse SELECTIONS (a vector of {from, to} objects) into a list of (from . to) conses.
-Clamp positions to buffer length."
+  "Parse SELECTIONS into a list of (from . to) conses.
+SELECTIONS is a vector of {from, to} objects.  BUF is used to
+clamp positions to buffer length."
   (let ((max-pos (with-current-buffer buf
                    (- (point-max) (point-min))))
         result)
