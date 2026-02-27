@@ -501,7 +501,12 @@ the SENTINEL will be called with an \"open\" event when ready."
   (cond
    ((string-prefix-p "open" event)
     (setf (braid-http-sub-status sub) :open)
-    (when request (process-send-string proc request)))
+    (when request
+      (condition-case _err
+          (process-send-string proc request)
+        (error
+         (setf (braid-http-sub-status sub) :disconnected)
+         (braid-http--schedule-reconnect sub)))))
 
    ((not (eq (braid-http-sub-status sub) :closed))
     ;; Unexpected disconnect — call on-disconnect BEFORE updating status
