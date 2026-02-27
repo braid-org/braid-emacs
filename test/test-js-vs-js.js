@@ -25,7 +25,7 @@ function create_client(url, name) {
                 state = state.slice(0, p.range[0]) + p.content + state.slice(p.range[1])
         },
         on_error: e => { errors.push(e.message || String(e)) },
-        on_online: s => { connected = !!(s && s.online) },
+        on_online: s => { connected = !!s },
         content_type: 'text/plain'
     })
 

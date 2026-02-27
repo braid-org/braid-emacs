@@ -127,7 +127,7 @@ function create_js_client(url) {
             }
         },
         on_error: e => { error_log.push(e.message || String(e)) },
-        on_online: s => { connected = !!(s && s.online) },
+        on_online: s => { connected = !!s },
         content_type: 'text/plain'
     })
 
