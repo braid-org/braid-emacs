@@ -137,10 +137,32 @@ to the buffer.  This is expected and not a real conflict."
   (interactive)
   (message "(No no; already saved to network!)"))
 
-(defun braid-mode--after-change (beg end old-len)
-  "Push local buffer edits to the server."
+(defvar-local braid-mode--bc-count 0
+  "Before-change call count since last after-change.
+When > 1, the after-change handler falls back to Myers diff.")
+(put 'braid-mode--bc-count 'permanent-local t)
+
+(defun braid-mode--before-change (_beg _end)
+  "Count before-change calls to detect `combine-after-change-calls'.
+When multiple before-change calls fire before a single after-change,
+the combined after-change args may not cover all changes, so the
+after-change handler must fall back to a full diff."
   (when braid-mode--bt
-    (braid-text-buffer-changed braid-mode--bt beg end old-len))
+    (cl-incf braid-mode--bc-count)))
+
+(defun braid-mode--after-change (beg end old-len)
+  "Push local buffer edits to the server.
+Uses after-change args for the fast path (single change), or falls
+back to a full Myers diff when `combine-after-change-calls' was
+active (detected via bc-count > 1)."
+  (when braid-mode--bt
+    (if (> braid-mode--bc-count 1)
+        ;; Combined change — after-change args may not cover all edits.
+        ;; Fall back to full diff.
+        (braid-text-buffer-changed braid-mode--bt)
+      ;; Normal single change — fast path with old-len.
+      (braid-text-buffer-changed braid-mode--bt beg end old-len)))
+  (setq braid-mode--bc-count 0)
   ;; Cursor transforms are handled by the :on-edit hook in braid-text,
   ;; which fires for both local and remote edits.
   ;; Always keep the buffer appearing unmodified — whether we sent a change
@@ -172,6 +194,7 @@ to the buffer.  This is expected and not a real conflict."
 (defun braid-mode--install-hooks ()
   "Install buffer-local hooks needed by braid-mode.
 Called on enable and after major-mode changes (which kill buffer-local hooks)."
+  (add-hook 'before-change-functions #'braid-mode--before-change nil t)
   (add-hook 'after-change-functions #'braid-mode--after-change nil t)
   (add-hook 'kill-buffer-hook #'braid-mode--on-kill nil t))
 
@@ -230,6 +253,7 @@ Enable with `braid-connect'; disable to close the connection."
         (setq create-lockfiles nil)
         ;; Make C-x C-s a no-op — edits are synced live, not saved to disk.
         (local-set-key (kbd "C-x C-s") #'braid-mode--save-noop))
+    (remove-hook 'before-change-functions #'braid-mode--before-change t)
     (remove-hook 'after-change-functions #'braid-mode--after-change t)
     (remove-hook 'kill-buffer-hook #'braid-mode--on-kill t)
     ;; Remove indicator from mode line.
