@@ -55,7 +55,7 @@
         (setq braid-text-debug t)
         (setq fuzz-bt
               (braid-text-open host port path fuzz-buf
-                               :heartbeat-interval nil
+                               :heartbeats nil
                                :on-connect (lambda ()
                                              (setq fuzz-connected t)
                                              (setq fuzz-disconnected nil))
@@ -158,10 +158,16 @@
       '((ok . t)))
 
      ((equal cmd "open-cursors")
-      (setq fuzz-bc (braid-cursors-open fuzz-bt))
-      (if fuzz-bc
-          '((ok . t))
-        '((ok . :json-false) (error . "server does not support cursors"))))
+      (let ((result nil)
+            (deadline (+ (float-time) 10)))
+        (braid-cursors-start-sharing fuzz-bt
+          (lambda (bc) (setq fuzz-bc bc) (setq result t)))
+        ;; Spin event loop until callback fires
+        (while (and (null result) (< (float-time) deadline))
+          (accept-process-output nil 0.05))
+        (if fuzz-bc
+            '((ok . t))
+          '((ok . :json-false) (error . "server does not support cursors")))))
 
      ((equal cmd "set-cursor")
       ;; pos is 0-indexed code-point offset

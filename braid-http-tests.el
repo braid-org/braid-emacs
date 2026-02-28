@@ -404,7 +404,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
   (let ((sub (make-braid-http-sub
               :host "127.0.0.1" :port 8888 :path "/test"
               :peer "test"
-              :heartbeat-interval 30
+              :heartbeats 30
               :stage :outer-headers
               :raw-buf "HTTP/1.1 209 \r\n\r\n"
               :on-message (lambda (_)))))
@@ -417,11 +417,11 @@ into the sub-headers parser, simulating what arrives after dechunking."
         (cancel-timer (braid-http-sub-heartbeat-timer sub))))))
 
 (ert-deftest braid-heartbeat/no-timer-without-interval ()
-  "No heartbeat timer when heartbeat-interval is nil."
+  "No heartbeat timer when heartbeats is nil."
   (let ((sub (make-braid-http-sub
               :host "127.0.0.1" :port 8888 :path "/test"
               :peer "test"
-              :heartbeat-interval nil
+              :heartbeats nil
               :stage :outer-headers
               :raw-buf "HTTP/1.1 209 \r\n\r\n"
               :on-message (lambda (_)))))
@@ -433,7 +433,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
   (let ((sub (make-braid-http-sub
               :host "127.0.0.1" :port 8888 :path "/test"
               :peer "test"
-              :heartbeat-interval 30
+              :heartbeats 30
               :stage :outer-headers
               :raw-buf "HTTP/1.1 209 \r\n\r\n"
               :on-message (lambda (_)))))
@@ -449,7 +449,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
          (sub (make-braid-http-sub
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test"
-               :heartbeat-interval interval
+               :heartbeats interval
                :status :connected
                :last-data-time (- (float-time) (+ timeout 1)))))
     (should (> (- (float-time) (braid-http-sub-last-data-time sub))
@@ -462,7 +462,7 @@ into the sub-headers parser, simulating what arrives after dechunking."
          (sub (make-braid-http-sub
                :host "127.0.0.1" :port 8888 :path "/test"
                :peer "test"
-               :heartbeat-interval interval
+               :heartbeats interval
                :status :connected
                :last-data-time (float-time))))
     (should-not (> (- (float-time) (braid-http-sub-last-data-time sub))
@@ -849,13 +849,13 @@ Prints PASS/FAIL for each step and exits with code 0 or 1."
          ;; Client A
          (buf-a (generate-new-buffer " *braid-test-A*"))
          (bt-a (braid-text-open "127.0.0.1" 8888 path buf-a
-                   :heartbeat-interval nil
+                   :heartbeats nil
                    :on-connect    (lambda () (setq connected-a t))
                    :on-disconnect (lambda () (setq disconnected-a t))))
          ;; Client B
          (buf-b (generate-new-buffer " *braid-test-B*"))
          (bt-b (braid-text-open "127.0.0.1" 8888 path buf-b
-                   :heartbeat-interval nil
+                   :heartbeats nil
                    :on-connect    (lambda () (setq connected-b t))
                    :on-disconnect (lambda () nil))))
 
@@ -956,13 +956,13 @@ treated stale buffer contents as local edits.  This test verifies:
          ;; Client A
          (buf-a (generate-new-buffer " *braid-test-A*"))
          (bt-a (braid-text-open "127.0.0.1" 8888 path buf-a
-                   :heartbeat-interval nil
+                   :heartbeats nil
                    :on-connect    (lambda () (setq connected-a t))
                    :on-disconnect (lambda () (setq disconnected-a t))))
          ;; Client B
          (buf-b (generate-new-buffer " *braid-test-B*"))
          (bt-b (braid-text-open "127.0.0.1" 8888 path buf-b
-                   :heartbeat-interval nil
+                   :heartbeats nil
                    :on-connect    (lambda () (setq connected-b t))
                    :on-disconnect (lambda () nil))))
 

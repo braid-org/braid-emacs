@@ -212,7 +212,7 @@ Returns (new-raw . new-body).  Partial chunks stay in new-raw."
   (last-parents     nil)   ; list of strings: sent as Parents on reconnect
   (parents-fn       nil)   ; function returning parents list; overrides last-parents on reconnect
   ;; Heartbeat-based dead-connection detection
-  (heartbeat-interval nil)   ; requested interval in seconds, or nil to disable
+  (heartbeats nil)   ; requested interval in seconds, or nil to disable
   (heartbeat-timer    nil)   ; recurring check timer
   (last-data-time     nil)   ; (float-time) of last data in filter
   ;; Callbacks
@@ -276,7 +276,7 @@ Returns nil if more data is needed."
               (setf (braid-http-sub-status sub) :connected)
               (setf (braid-http-sub-reconnect-delay sub) 1.0) ; reset backoff
               ;; Start heartbeat watchdog timer
-              (when-let ((hb (braid-http-sub-heartbeat-interval sub)))
+              (when-let ((hb (braid-http-sub-heartbeats sub)))
                 (setf (braid-http-sub-last-data-time sub) (float-time))
                 (let ((timeout (+ (* 1.2 hb) 3)))
                   (setf (braid-http-sub-heartbeat-timer sub)
@@ -287,7 +287,8 @@ Returns nil if more data is needed."
                                       (braid-http-sub-last-data-time sub)
                                       (> (- (float-time) (braid-http-sub-last-data-time sub))
                                          timeout))
-                             (message "Braid: heartbeat timeout (no data for %.0fs) — reconnecting" timeout)
+                             (when (bound-and-true-p braid-text-debug)
+                               (message "Braid: heartbeat timeout (no data for %.0fs) — reconnecting" timeout))
                              (delete-process (braid-http-sub-process sub))))))))
               (when (braid-http-sub-on-connect sub)
                 (funcall (braid-http-sub-on-connect sub))))
@@ -455,7 +456,7 @@ the SENTINEL will be called with an \"open\" event when ready."
   (when (braid-http-sub-heartbeat-timer sub)
     (cancel-timer (braid-http-sub-heartbeat-timer sub))
     (setf (braid-http-sub-heartbeat-timer sub) nil))
-  (let* ((hb-interval (braid-http-sub-heartbeat-interval sub))
+  (let* ((hb-interval (braid-http-sub-heartbeats sub))
          (headers (append `(("Subscribe" . "true")
                              ("Peer"      . ,(braid-http-sub-peer sub)))
                            (when hb-interval
@@ -554,8 +555,8 @@ Resets the backoff delay to 1.0.  No-op if SUB is not disconnected."
 ;;;; ======================================================================
 
 (cl-defun braid-http-subscribe (host port path on-message
-                          &key on-connect on-disconnect peer extra-headers tls
-                          heartbeat-interval parents-fn)
+                          &key on-connect on-disconnect peer headers tls
+                          heartbeats parents-fn)
   "Open a Braid-HTTP GET subscription to HOST:PORT/PATH.
 
 ON-MESSAGE is called for each sub-response in the 209 stream with a plist:
@@ -570,8 +571,8 @@ ON-DISCONNECT is called (no args) on any unexpected disconnect.
   The subscription will automatically reconnect.
 
 PEER is a peer identifier string (random if omitted).
-EXTRA-HEADERS is an alist of additional GET headers sent on every connect.
-HEARTBEAT-INTERVAL, when non-nil, requests heartbeats from the server
+HEADERS is an alist of additional GET headers sent on every connect.
+HEARTBEATS, when non-nil, requests heartbeats from the server
   every N seconds and kills the connection if no data arrives within
   1.2*N+3 seconds.
 PARENTS-FN, when non-nil, is a function called on each reconnect to get
@@ -589,8 +590,8 @@ Returns a braid-http-sub struct.  Pass to braid-http-unsubscribe to close."
               :on-message         on-message
               :on-connect         on-connect
               :on-disconnect      on-disconnect
-              :extra-headers      extra-headers
-              :heartbeat-interval heartbeat-interval
+              :extra-headers      headers
+              :heartbeats heartbeats
               :parents-fn         parents-fn)))
     (braid-http--open sub nil)
     sub))

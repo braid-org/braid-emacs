@@ -313,7 +313,11 @@ Enable with `braid-connect'; disable to close the connection."
   (setq braid-mode--ever-connected t)
   ;; Retry cursor setup if it failed earlier (e.g. server was not running).
   (when (and (not braid-mode--bc) braid-mode--bt)
-    (setq braid-mode--bc (braid-cursors-open braid-mode--bt))))
+    (let ((buf (current-buffer)))
+      (braid-cursors-start-sharing braid-mode--bt
+        (lambda (bc) (when (buffer-live-p buf)
+                       (with-current-buffer buf
+                         (setq braid-mode--bc bc))))))))
 
 (defun braid-mode--on-disconnect ()
   "Called on unexpected disconnect.  Tries TLS fallback if never connected.
@@ -373,7 +377,10 @@ rather than a server that is simply not running."
                                                        (with-current-buffer buf
                                                          (when braid-mode--bc
                                                            (braid-cursors-on-edit braid-mode--bc patches)))))))
-                            (setq braid-mode--bc (braid-cursors-open braid-mode--bt)))))))))
+                            (braid-cursors-start-sharing braid-mode--bt
+                              (lambda (bc) (when (buffer-live-p buf)
+                                             (with-current-buffer buf
+                                               (setq braid-mode--bc bc))))))))))))
 
 (defun braid-connect (url)
   "Connect the current buffer to the braid-text resource at URL.
@@ -409,8 +416,11 @@ URL is an http:// or https:// URL string."
                                                 (with-current-buffer buf
                                                   (when braid-mode--bc
                                                     (braid-cursors-on-edit braid-mode--bc patches)))))))
-      ;; Start cursor sharing
-      (setq braid-mode--bc (braid-cursors-open braid-mode--bt))
+      ;; Start cursor sharing (async HEAD probe)
+      (braid-cursors-start-sharing braid-mode--bt
+        (lambda (bc) (when (buffer-live-p buf)
+                       (with-current-buffer buf
+                         (setq braid-mode--bc bc)))))
       ;; Set initial reconnect cap based on whether this buffer is focused.
       (let* ((focused (eq buf (window-buffer (selected-window))))
              (max-d   (if focused

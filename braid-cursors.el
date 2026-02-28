@@ -51,77 +51,103 @@
 ;;;; Feature detection
 ;;;; ======================================================================
 
-(defun braid-cursors--check-support (host port path tls)
-  "Check if server supports cursors for PATH via HEAD request.
-Returns non-nil if the server responds 200 with Content-Type
-containing application/text-cursors+json."
-  (condition-case nil
-      (let* ((buf  (generate-new-buffer " *braid-cursor-head*"))
-             (proc (open-network-stream
-                    "braid-cursor-head" buf
-                    host port
-                    :type (if tls 'tls 'plain)))
-             (cookie-headers
-              (mapconcat (lambda (h) (format "%s: %s\r\n" (car h) (cdr h)))
-                         (braid-http--cookie-header host port) ""))
-             (request (concat (format "HEAD %s HTTP/1.1\r\n" path)
-                              (format "Host: %s\r\n"
-                                      (braid-http--format-host host port))
-                              "Accept: application/text-cursors+json\r\n"
-                              cookie-headers
-                              "Connection: close\r\n"
-                              "\r\n"))
-             (response ""))
-        (process-send-string proc request)
-        (while (accept-process-output proc 5))
-        (setq response (with-current-buffer buf (buffer-string)))
-        (delete-process proc)
-        (kill-buffer buf)
-        (and (string-match-p "HTTP/[0-9.]+ 200" response)
-             (let ((case-fold-search t))
-               (string-match-p "content-type:.*application/text-cursors\\+json"
-                               response))))
-    (error nil)))
+(defun braid-cursors-supported-p-async (host port path tls callback)
+  "Check if server supports cursors via async HEAD request.
+Calls CALLBACK with non-nil if the server responds 200 with
+Content-Type containing application/text-cursors+json, nil otherwise.
+CALLBACK is called exactly once."
+  (let ((done nil))
+    (condition-case nil
+        (let* ((response "")
+               (timer nil)
+               (cookie-headers
+                (mapconcat (lambda (h) (format "%s: %s\r\n" (car h) (cdr h)))
+                           (braid-http--cookie-header host port) ""))
+               (request (concat (format "HEAD %s HTTP/1.1\r\n" path)
+                                (format "Host: %s\r\n"
+                                        (braid-http--format-host host port))
+                                "Accept: application/text-cursors+json\r\n"
+                                cookie-headers
+                                "Connection: close\r\n"
+                                "\r\n"))
+               (finish (lambda (result)
+                         (unless done
+                           (setq done t)
+                           (when timer (cancel-timer timer))
+                           (funcall callback result))))
+               (proc (braid-http--make-process
+                      "braid-cursor-head"
+                      host port tls
+                      ;; Filter: accumulate response, check when headers complete
+                      (lambda (proc data)
+                        (setq response (concat response data))
+                        (when (string-match "\r\n\r\n" response)
+                          (when (process-live-p proc) (delete-process proc))
+                          (funcall finish
+                                   (and (string-match-p "HTTP/[0-9.]+ 200" response)
+                                        (let ((case-fold-search t))
+                                          (string-match-p
+                                           "content-type:.*application/text-cursors\\+json"
+                                           response))
+                                        t))))
+                      ;; Sentinel: send request on open; fail on unexpected close
+                      (lambda (proc event)
+                        (cond
+                         ((string-prefix-p "open" event)
+                          (process-send-string proc request))
+                         (t (funcall finish nil))))
+                      'nowait)))
+          ;; Timeout after 5 seconds
+          (setq timer (run-with-timer 5.0 nil
+                        (lambda ()
+                          (when (process-live-p proc)
+                            (delete-process proc))
+                          (funcall finish nil)))))
+      (error (unless done (funcall callback nil))))))
 
 
 ;;;; ======================================================================
 ;;;; Public API
 ;;;; ======================================================================
 
-(defun braid-cursors-open (bt)
+(defun braid-cursors-start-sharing (bt callback)
   "Start cursor sharing for a braid-text connection BT.
-Returns a `braid-cursor' struct, or nil if the server does not support cursors."
-  (if (not (braid-cursors--check-support
-            (braid-text-host bt) (braid-text-port bt)
-            (braid-text-path bt) (braid-text-tls bt)))
-      nil
-  (let* ((bc (make-braid-cursor
-              :bt bt
-              :remote (make-hash-table :test 'equal)
-              :put-queue "")))
-    ;; Open persistent PUT connection
-    (setf (braid-cursor-put-proc bc) (braid-cursors--put-proc-open bc))
-    ;; Subscribe for cursor updates
-    (setf (braid-cursor-sub bc)
-          (braid-http-subscribe
-           (braid-text-host bt) (braid-text-port bt) (braid-text-path bt)
-           (lambda (msg) (braid-cursors--on-update bc msg))
-           :peer (braid-text-peer bt)
-           :tls (braid-text-tls bt)
-           :extra-headers '(("Accept" . "application/text-cursors+json")
-                             ("Heartbeats" . "10"))
-           :on-connect (lambda ()
-                         (let ((buf (braid-text-buffer (braid-cursor-bt bc))))
-                           (when (buffer-live-p buf)
-                             (with-current-buffer buf
-                               (braid-cursors--force-send bc)))))
-           :on-disconnect (lambda () (braid-cursors--clear-all bc))))
-    ;; Install post-command-hook for sending local cursor
-    (let ((fn (lambda () (braid-cursors--maybe-send bc))))
-      (setf (braid-cursor-hook-fn bc) fn)
-      (with-current-buffer (braid-text-buffer bt)
-        (add-hook 'post-command-hook fn nil t)))
-    bc)))
+Performs an async HEAD probe per the selections spec.  If the server
+supports cursors, sets up subscription and calls CALLBACK with the
+`braid-cursor' struct.  If not supported, calls CALLBACK with nil."
+  (braid-cursors-supported-p-async
+   (braid-text-host bt) (braid-text-port bt)
+   (braid-text-path bt) (braid-text-tls bt)
+   (lambda (supported)
+     (if (not supported)
+         (funcall callback nil)
+       (let* ((bc (make-braid-cursor
+                   :bt bt
+                   :remote (make-hash-table :test 'equal)
+                   :put-queue "")))
+         ;; Open persistent PUT connection
+         (setf (braid-cursor-put-proc bc) (braid-cursors--put-proc-open bc))
+         ;; Subscribe to cursor updates
+         (setf (braid-cursor-sub bc)
+               (braid-http-subscribe
+                (braid-text-host bt) (braid-text-port bt) (braid-text-path bt)
+                (lambda (msg) (braid-cursors--on-update bc msg))
+                :peer (braid-text-peer bt)
+                :tls (braid-text-tls bt)
+                :heartbeats 10
+                :headers '(("Accept" . "application/text-cursors+json"))
+                :on-connect (lambda ()
+                              (let ((buf (braid-text-buffer (braid-cursor-bt bc))))
+                                (when (buffer-live-p buf)
+                                  (with-current-buffer buf
+                                    (braid-cursors--force-send bc)))))
+                :on-disconnect (lambda () (braid-cursors--clear-all bc))))
+         ;; Install post-command-hook for sending local cursor
+         (let ((fn (lambda () (braid-cursors--maybe-send bc))))
+           (setf (braid-cursor-hook-fn bc) fn)
+           (with-current-buffer (braid-text-buffer bt)
+             (add-hook 'post-command-hook fn nil t)))
+         (funcall callback bc))))))
 
 (defun braid-cursors--clear-all (bc)
   "Remove all remote cursor/selection overlays and clear state."

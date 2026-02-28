@@ -57,7 +57,7 @@
 
 (cl-defun braid-text-open (host port path buffer
                           &key tls on-connect on-disconnect on-edit
-                          (heartbeat-interval 30))
+                          (heartbeats 30))
   "Subscribe BUFFER to the braid-text resource at HOST:PORT/PATH.
 Uses the simpleton merge type.  Returns a braid-text struct.
 Pass the struct to `braid-text-buffer-changed' whenever the buffer
@@ -68,7 +68,7 @@ ON-CONNECT and ON-DISCONNECT are optional callbacks forwarded to
 ON-EDIT, when non-nil, is called with a list of patches after any edit
 \(local or remote).  Each patch is (:start S :end E :content C) with
 0-indexed absolute coordinates relative to the pre-edit state.
-HEARTBEAT-INTERVAL (default 30) requests server heartbeats every N seconds.
+HEARTBEATS (default 30) requests server heartbeats every N seconds.
 Set to nil to disable heartbeat-based dead connection detection."
   (let* ((peer (format "emacs%04x%04x" (random #xffff) (random #xffff)))
          (bt   (make-braid-text :host   host
@@ -108,10 +108,10 @@ Set to nil to disable heartbeat-based dead connection detection."
                                 (braid-text--changed bt)))
                             (when on-connect (funcall on-connect)))
            :on-disconnect on-disconnect
-           :heartbeat-interval heartbeat-interval
+           :heartbeats heartbeats
            :parents-fn    (lambda () (braid-text-client-version bt))
-           :extra-headers '(("Merge-Type" . "simpleton")
-                            ("Accept"     . "text/plain, text/markdown, text/html, application/json"))))
+           :headers '(("Merge-Type" . "simpleton")
+                      ("Accept"     . "text/plain, text/markdown, text/html, application/json"))))
     
     (setf (braid-text-put-proc bt) (braid-text--put-proc-open bt))
     bt))
@@ -264,7 +264,7 @@ because the server will send patches from our version, not a full snapshot."
          (on-connect    (braid-http-sub-on-connect old-sub))
          (on-disconnect (braid-http-sub-on-disconnect old-sub))
          (max-delay     (braid-http-sub-reconnect-max-delay old-sub))
-         (hb-interval   (braid-http-sub-heartbeat-interval old-sub)))
+         (hb-interval   (braid-http-sub-heartbeats old-sub)))
     ;; Close the old subscription
     (braid-http-unsubscribe old-sub)
     ;; Reconnect put-proc
@@ -280,10 +280,10 @@ because the server will send patches from our version, not a full snapshot."
                                     :tls           (braid-text-tls bt)
                                     :on-connect    on-connect
                                     :on-disconnect on-disconnect
-                                    :heartbeat-interval hb-interval
+                                    :heartbeats hb-interval
                                     :parents-fn    (lambda () (braid-text-client-version bt))
-                                    :extra-headers '(("Merge-Type" . "simpleton")
-                                                      ("Accept"     . "text/plain, text/markdown, text/html, application/json")))))
+                                    :headers '(("Merge-Type" . "simpleton")
+                                               ("Accept"     . "text/plain, text/markdown, text/html, application/json")))))
       (setf (braid-http-sub-reconnect-max-delay new-sub) max-delay)
       (setf (braid-text-sub bt) new-sub))))
 
@@ -514,6 +514,11 @@ from that version, or wait for a retry PUT to establish the version."
               ;; Capture content-type from server for use in PUTs.
               (when-let ((ct (cdr (assoc "content-type" headers))))
                 (setf (braid-text-content-type bt) ct))
+              ;; Diagnostic logging for digest debugging
+              (when braid-text-debug
+                (message "Braid: post-apply client-state len=%d digest=%s"
+                         (length (braid-text-client-state bt))
+                         (braid-text--repr-digest (braid-text-client-state bt))))
               ;; Verify integrity if the server sent a repr-digest.
               ;; Compare against client-state (= buffer after applying patches).
               ;; On mismatch: CRASH HARD (D6).  A digest mismatch means the
