@@ -82,14 +82,17 @@ CALLBACK is called exactly once."
                       (lambda (proc data)
                         (setq response (concat response data))
                         (when (string-match "\r\n\r\n" response)
-                          (when (process-live-p proc) (delete-process proc))
+                          ;; Call finish BEFORE delete-process, because
+                          ;; delete-process triggers the sentinel synchronously
+                          ;; which would call (finish nil) first.
                           (funcall finish
                                    (and (string-match-p "HTTP/[0-9.]+ 200" response)
                                         (let ((case-fold-search t))
                                           (string-match-p
                                            "content-type:.*application/text-cursors\\+json"
                                            response))
-                                        t))))
+                                        t))
+                          (when (process-live-p proc) (delete-process proc))))
                       ;; Sentinel: send request on open; fail on unexpected close
                       (lambda (proc event)
                         (cond

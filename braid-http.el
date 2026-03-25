@@ -313,8 +313,9 @@ Returns t if a complete header block was parsed, nil if more data needed."
       (let* ((block   (substring buf 0 end))
              (lines   (split-string block "\r\n"))
              ;; First line is the sub-response status ("200 OK"), rest are headers
+             (header-lines (cdr lines))
              (headers (braid-http-parse-header-block
-                       (mapconcat #'identity (cdr lines) "\r\n")))
+                       (mapconcat #'identity header-lines "\r\n")))
              (cl-str  (cdr (assoc "content-length" headers)))
              (cl      (if cl-str (string-to-number cl-str) 0)))
         (setf (braid-http-sub-cur-headers sub) headers)
@@ -324,10 +325,24 @@ Returns t if a complete header block was parsed, nil if more data needed."
         (let ((patches-str (cdr (assoc "patches" headers))))
           (if patches-str
               (let ((n (string-to-number patches-str)))
-                (setf (braid-http-sub-cur-patches-n    sub) n)
-                (setf (braid-http-sub-cur-patches-i    sub) 0)
-                (setf (braid-http-sub-cur-patches-list sub) nil)
-                (setf (braid-http-sub-stage            sub) :patch-n-headers))
+                (if (= n 0)
+                    ;; Patches: 0 — version-only update, emit immediately
+                    (let* ((ver-str (cdr (assoc "version" headers)))
+                           (par-str (cdr (assoc "parents" headers)))
+                           (version (braid-http-parse-version ver-str))
+                           (parents (braid-http-parse-version par-str))
+                           (msg (list :version version :parents parents
+                                      :patches nil :body nil
+                                      :content-range nil :headers headers)))
+                      (when version
+                        (setf (braid-http-sub-last-parents sub) version))
+                      (setf (braid-http-sub-stage sub) :sub-headers)
+                      (when (braid-http-sub-on-message sub)
+                        (funcall (braid-http-sub-on-message sub) msg)))
+                  (setf (braid-http-sub-cur-patches-n    sub) n)
+                  (setf (braid-http-sub-cur-patches-i    sub) 0)
+                  (setf (braid-http-sub-cur-patches-list sub) nil)
+                  (setf (braid-http-sub-stage            sub) :patch-n-headers)))
             (setf (braid-http-sub-stage sub) :body)))
         t))))
 
